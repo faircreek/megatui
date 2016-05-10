@@ -1,0 +1,3214 @@
+#!/usr/bin/python
+#
+
+#    This program is free software: you can redistribute it and/or modify
+#    it under the terms of the GNU General Public License as published by
+#    the Free Software Foundation, either version 2 of the License, or
+#    (at your option) any later version.
+#
+#    This program is distributed in the hope that it will be useful,
+#    but WITHOUT ANY WARRANTY; without even the implied warranty of
+#    MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+#    GNU General Public License for more details.
+#
+#    You should have received a copy of the GNU General Public License
+#    along with this program.  If not, see <http://www.gnu.org/licenses/>.
+
+#    Written by Ad am Cec ile <gan dalf@NOSPAM.le- vert.net>
+#    Modified by Vi ncent S. Coj ot <vin cent@NOSPAM.coi jot.name>
+
+#    Completly transformed into MegaTUI by Olof 
+
+import os
+import re
+import sys
+from glob import glob
+import time
+import logging
+import logging.handlers
+from collections import namedtuple
+import traceback
+
+#######################################################################
+
+
+class formatControl:
+
+    BOLD = ''
+    BLINK = ''
+    DIM = ''
+    REVERSE = ''
+    NORMAL = ''
+
+    BLACK = RED = GREEN = YELLOW = BLUE = MAGENTA = CYAN = WHITE = ''
+
+    BG_BLACK = BG_RED = BG_GREEN = BG_YELLOW = BG_BLUE = BG_MAGENTA = BG_CYAN = BG_WHITE = ''
+
+    _CAPABILITIES = "BOLD=bold BLINK=blink DIM=dim REVERSE=rev UNDERLINE=smul NO_UNDERLINE=rmul NORMAL=sgr0".split()
+    _ANSICOLORS = "BLACK RED GREEN YELLOW BLUE MAGENTA CYAN WHITE".split()
+
+    def __init__(self, term_stream=sys.stdout):
+
+        import curses
+
+        if not term_stream.isatty():
+            return
+
+        curses.setupterm()
+
+        for capability in self._CAPABILITIES:
+            (attrib, cap_name) = capability.split('=')
+            setattr(self, attrib, self._tigetstr(cap_name) or '')
+
+        set_fg_ansi = self._tigetstr('setaf')
+        if set_fg_ansi:
+            for i, color in enumerate(self._ANSICOLORS):
+                setattr(self, color, curses.tparm(set_fg_ansi, i) or '')
+
+        set_bg_ansi = self._tigetstr('setab')
+        if set_bg_ansi:
+            for i, color in enumerate(self._ANSICOLORS):
+                setattr(self, 'BG_' + color, curses.tparm(set_bg_ansi, i) or '')
+
+    def _tigetstr(self, cap_name):
+        import curses
+        cap = curses.tigetstr(cap_name) or ''
+        return re.sub(r'\$<\d+>[/*]?', '', cap)
+
+
+#######################################################################
+
+
+# Sane defaults
+debugmode = False
+totaldrivenumber = 0
+totalunconfdrivenumber = 0
+arraydb = []
+diskdb = []
+controllerdb = []
+controller_defaults = []
+foreigndiskdb = []
+try:
+    ip = os.environ["PS1"]
+    IP = ip.split('@')[1].split(':')[0].strip()
+except KeyError:
+    IP = "$> "
+prompt = "[%s]> " % IP
+
+controllernumber = 0
+totalarraynumber = 0
+
+# Get mapping system disks MegaRaid virtual disks
+diskdict = {}
+
+#Are we on a serial console or not
+serial = False
+PPID = os.getppid()
+o_string = "/proc/%s/fd/0" % PPID
+if re.match('ttyS', os.path.basename(os.readlink(o_string))):
+    serial = True
+
+# Hardcode a max of 16 HBA for now. LDTable must be initiazlied to accept populating list of
+# LD's into each ctlr's list.
+# LDTable = [[] * 16 for itable in range(16)]
+
+# Only Quit or a number, no gobbledygook
+
+
+# Startup
+def print_usage():
+    print 'Usage: megaraid-status [--debug]'
+
+
+if len(sys.argv) > 2:
+    print_usage()
+    sys.exit(1)
+
+
+if len(sys.argv) > 1:
+    if sys.argv[1] == '--debug':
+        debugmode = True
+    else:
+        print_usage()
+        sys.exit(1)
+
+logging.raiseExceptions = False  # If logging aint working, trying to log later on
+                                 # in the code will throw an exception. We don't
+                                 # want a try/pass each time we log so set it to false
+
+LOG = logging.getLogger('main')
+LOG.setLevel(logging.INFO)
+
+try:
+    handler = logging.handlers.SysLogHandler("/dev/log", "local3")
+except Exception:
+    pass
+    # typ, exc, tb = sys.exc_info()
+    # fil, line, func, _ = traceback.extract_tb(tb)[-1]
+    # where = "%s:%d in %s" % (fil, line, func)
+    # print "Warning: No logging due to syslog error: %s" % (str(exc))
+else:
+    logformat = ("megacli-tui: %(message)s")
+    handler.setFormatter(logging.Formatter(logformat))
+    LOG.addHandler(handler)
+
+
+# Functions
+def dbgprint(msg):
+    if (debugmode):
+        sys.stderr.write("# DEBUG : %s\n" % msg)
+
+
+def is_exe(fpath):
+    return os.path.isfile(fpath) and os.access(fpath, os.X_OK)
+
+
+def which(program):
+    import os
+    fpath, fname = os.path.split(program)
+    if fpath:
+        if is_exe(program):
+            return program
+    else:
+        # Add some defaults
+        os.environ["PATH"] += os.pathsep + '/opt/MegaRAID/MegaCli'
+        os.environ["PATH"] += os.pathsep + '/ms/dist/hwmgmt/bin'
+        os.environ["PATH"] += os.pathsep + os.path.dirname(os.path.realpath(sys.argv[0]))
+        for path in os.environ["PATH"].split(os.pathsep):
+            dbgprint('Looking in PATH ' + str(path))
+            path = path.strip('"')
+            exe_file = os.path.join(path, program)
+            if is_exe(exe_file):
+                dbgprint('Found "' + program + '" at ' + exe_file)
+                return exe_file
+    return None
+
+# Find MegaCli
+for megabin in "MegaCli64", "MegaCli", "megacli":
+    dbgprint('Looking for ' + str(megabin) + ' in PATH next..')
+    megaclipath = which(megabin)
+    if (megaclipath != None):
+        dbgprint('Will use MegaCLI from here: ' + str(megaclipath))
+        break
+
+# Check binary exists (and +x), if not print an error message
+if (megaclipath != None):
+    if os.path.exists(megaclipath) and os.access(megaclipath, os.X_OK):
+        pass
+    else:
+        if nagiosmode:
+            print 'UNKNOWN - Cannot find ' + megaclipath
+        else:
+            print 'Cannot find ' + megaclipath + 'in your PATH. Please install it.'
+        sys.exit(3)
+else:
+    print 'Cannot find "MegaCli64","MegaCli" or "megacli" in your PATH. Please install it.'
+    sys.exit(3)
+
+
+def is_error(output):
+    if output[-1] != "Exit Code: 0x00":
+        return True
+    return False
+
+
+# Get command output
+def getOutput(cmd):
+    lines = []
+    output = os.popen(cmd)
+    for line in output:
+        if not re.match(r'^$', line.strip()):
+            lines.append(line.strip())
+    return lines
+
+
+def osMap():
+    files_list = glob('/sys/block/sd?/device')
+    for a_file in sorted(files_list):
+        osdisk = os.path.basename(os.path.dirname(a_file))
+        device = os.path.basename(os.readlink(a_file))
+        parts = re.split(':', device)
+        dev = "c%sa%s" % (parts[0], parts[2])
+        diskdict[dev] = osdisk
+
+
+def getFormat(string):
+    term = formatControl()
+    # PPID = os.getppid()
+    # serial = "/proc/%s/fd/0" % PPID
+    # No matter what mute formating when we are on a serial console
+    # Regardless what curses tells us.
+    # if re.match('ttyS', os.path.basename(os.readlink(serial))):
+    if serial:
+        string = string.replace("<b>", "")
+        string = string.replace("<bl>", "")
+        string = string.replace("<dm>", "")
+        string = string.replace("<r>", "")
+        string = string.replace("<u>", "")
+        string = string.replace("</u>", "")
+        string = string.replace("</n>", "")
+        string = string.replace("<black>", "")
+        string = string.replace("<red>", "")
+        string = string.replace("<green>", "")
+        string = string.replace("<yellow>", "")
+        string = string.replace("<blue>", "")
+        string = string.replace("<magenta>", "")
+        string = string.replace("<cyan>", "")
+        string = string.replace("<white>", "")
+        string = string.replace("<bg_black>", "")
+        string = string.replace("<bg_red>", "")
+        string = string.replace("<bg_green>", "")
+        string = string.replace("<bg_yellow>", "")
+        string = string.replace("<bg_blue>", "")
+        string = string.replace("<bg_magenta>", "")
+        string = string.replace("<bg_cyan>", "")
+        string = string.replace("<bg_white>", "")
+        return string
+
+    string = string.replace("<b>", term.BOLD)
+    string = string.replace("<bl>", term.BLINK)
+    string = string.replace("<dm>", term.DIM)
+    string = string.replace("<r>", term.REVERSE)
+    string = string.replace("<u>", term.UNDERLINE)
+    string = string.replace("</u>", term.NO_UNDERLINE)
+    string = string.replace("</n>", term.NORMAL)
+    string = string.replace("<black>", term.BLACK)
+    string = string.replace("<red>", term.RED)
+    string = string.replace("<green>", term.GREEN)
+    string = string.replace("<yellow>", term.YELLOW)
+    string = string.replace("<blue>", term.BLUE)
+    string = string.replace("<magenta>", term.MAGENTA)
+    string = string.replace("<cyan>", term.CYAN)
+    string = string.replace("<white>", term.WHITE)
+    string = string.replace("<bg_black>", term.BG_BLACK)
+    string = string.replace("<bg_red>", term.BG_RED)
+    string = string.replace("<bg_green>", term.BG_GREEN)
+    string = string.replace("<bg_yellow>", term.BG_YELLOW)
+    string = string.replace("<bg_blue>", term.BG_BLUE)
+    string = string.replace("<bg_magenta>", term.BG_MAGENTA)
+    string = string.replace("<bg_cyan>", term.BG_CYAN)
+    string = string.replace("<bg_white>", term.BG_WHITE)
+    return string
+
+
+def returnControllerNumber(output):
+    # Get if we have any controllers at all
+    for line in output:
+        if re.match(r'^Controller Count.*$', line.strip()):
+            return int(line.split(':')[1].strip().strip('.'))
+
+
+def checkControllers():
+    global controllernumber
+    cmd = '%s -adpCount -NoLog' % (megaclipath)
+    output = getOutput(cmd)
+    controllernumber = returnControllerNumber(output)
+    if not controllernumber:
+        print "No MegaRAID or PERC adapter detected on your system!"
+        exit(1)
+
+
+def returnWdthFromArrayCol(glarray, idx):
+    maxwdth = 0
+    for glrow in glarray:
+        if (len(glrow[idx]) > maxwdth):
+            maxwdth = len(glrow[idx])
+    return maxwdth
+
+
+#Will return length of a field in an array of namedtuples, field_in_namedtuple is a string containing the name of the field
+def returnWdthFromArrayOfNamedTupleField(array_of_namedtuples, field_in_namedtuple):
+    maxwdth = 0
+    for namedtuple_thingy in array_of_namedtuples:
+        dict_of_namedtuple = namedtuple_thingy._asdict()
+        if len(dict_of_namedtuple[field_in_namedtuple]) > maxwdth:
+            maxwdth = len(dict_of_namedtuple[field_in_namedtuple])
+    return maxwdth
+
+
+def returnTotalDriveNumber(output):
+    for line in output:
+        if re.match(r'Number of Physical Drives on Adapter.*$', line.strip()):
+            return int(line.split(':')[1].strip())
+
+
+def returnControllerModel(output):
+    for line in output:
+        if re.match(r'^Product Name.*$', line.strip()):
+            return line.split(':')[1].strip()
+
+
+def returnMemorySize(output):
+    for line in output:
+        if re.match(r'^Memory Size.*$', line.strip()):
+            return line.split(':')[1].strip()
+
+
+def returnFirmwareVersion(output):
+    for line in output:
+        if re.match(r'^FW Package Build.*$', line.strip()):
+            return line.split(':')[1].strip()
+
+
+def returnROCTemp(output):
+    ROCtemp = ''
+    tmpstr = ''
+    for line in output:
+        if re.match(r'^ROC temperature :.*$', line.strip()):
+            tmpstr = line.split(':')[1].strip()
+            ROCtemp = re.sub(' +.*$', '', tmpstr)
+    if (ROCtemp != ''):
+        return "%sC" % ROCtemp
+    else:
+        return str('N/A')
+
+
+def returnArrayNumber(output):
+    i = 0
+    for line in output:
+        if re.match(r'^Virtual Drive:.*$', line.strip()):
+            i += 1
+    return i
+
+
+def returnHBAPCIInfo(output):
+    busprefix = '0000'
+    busid = ''
+    devid = ''
+    functionid = ''
+    pcipath = ''
+    for line in output:
+        if re.match(r'^Bus Number.*:.*$', line.strip()):
+            busid = str(line.strip().split(':')[1].strip()).zfill(2)
+        if re.match(r'^Device Number.*:.*$', line.strip()):
+            devid = str(line.strip().split(':')[1].strip()).zfill(2)
+        if re.match(r'^Function Number.*:.*$', line.strip()):
+            functionid = str(line.strip().split(':')[1].strip()).zfill(1)
+    if busid:
+        pcipath = str(busprefix + ':' + busid + ':' + devid + '.' + functionid)
+        dbgprint("Array PCI path : %s" % pcipath)
+        return str(pcipath)
+    else:
+        return None
+
+
+def arrayTable(output, controllerid, arrayid):
+    controller_array_id = "c%sa%s" % (controllerid, arrayid)
+    operationlinennumber = False
+    linenumber = 0
+    targetid = ''
+    raidtype = ''
+    raidlvl = ''
+    size = ''
+    state = ''
+    strpsz = ''
+    dskcache = 'N/A'
+    properties = ''
+    properties2 = ''
+    dskaccess = ''
+    spandepth = 0
+    diskperspan = 0
+    ArrayDB = namedtuple('ArrayDB', ['cid',
+                                     'arrayid',
+                                     'controller_array_id',
+                                     'osdisk',
+                                     'raidtype',
+                                     'size',
+                                     'strpsz',
+                                     'properties',
+                                     'dskcache',
+                                     'state',
+                                     'targetid',
+                                     'inprogress',
+                                     'all_properties',
+                                     'dskaccess'])
+    for line in output:
+        if re.match(r'^Virtual Drive:.*(Target Id: [0-9]+).*$', line.strip()):
+            # Extract the SCSI Target ID
+            targetid = line.strip().split(':')[2].split(')')[0].strip()
+        if re.match(r'^RAID Level.*?:.*$', line.strip()):
+            # Extract the primary raid type, decide on X0 RAID level later when we hit Span Depth
+            raidlvl = int(line.strip().split(':')[1].split(',')[0].split('-')[1].strip())
+        if re.match(r'^Size.*?:.*$', line.strip()):
+            # Size reported in MB
+            if re.match(r'^.*MB$', line.strip().split(':')[1]):
+                size = line.strip().split(':')[1].strip('MB').strip()
+                if (float(size) > 1000):
+                    size = str(int(round(float(size) / 1000))) + 'G'
+                else:
+                    size = str(int(round(float(size)))) + 'M'
+            # Size reported in TB
+            elif re.match(r'^.*TB$', line.strip().split(':')[1]):
+                size = line.strip().split(':')[1].strip('TB').strip()
+                size = str(int(round(float(size) * 1000))) + 'G'
+            # Size reported in GB (default)
+            else:
+                size = line.strip().split(':')[1].strip('GB').strip()
+                size = str(int(round(float(size)))) + 'G'
+        if re.match(r'^Span Depth.*?:.*$', line.strip()):
+            # If Span Depth is greater than 1 chances are we have a RAID 10, 50 or 60
+            spandepth = line.strip().split(':')[1].strip()
+        if re.match(r'^State.*?:.*$', line.strip()):
+            state = line.strip().split(':')[1].strip()
+        if re.match(r'^Strip Size.*?:.*$', line.strip()):
+            strpsz = line.strip().split(':')[1].strip()
+        if re.match(r'^Number Of Drives.*:.*$', line.strip()):
+            diskperspan = int(line.strip().split(':')[1].strip())
+        if re.match(r'^Current Cache Policy.*?:.*$', line.strip()):
+            props = line.strip().split(':')[1].strip()
+            if re.search('ReadAdaptive', props):
+                properties += 'ADRA'
+            if re.search('ReadAhead ', props):
+                properties += 'RA'
+            if re.search('ReadAheadNone', props):
+                properties += 'NORA'
+            if re.search('WriteBack', props):
+                properties += ',WB'
+            if re.search('WriteThrough', props):
+                properties += ',WT'
+            if re.search('No Write', props):
+                properties2 += ',NoCachedBadBBU'
+            if re.search('Write Cache OK', props):
+                properties2 += ',CachedBadBBU'
+            if re.search('Direct', props):
+                properties2 += ',Direct'
+            if re.search('Cached', props):
+                properties2 += ',Cached'
+        if re.match(r'^Disk Cache Policy.*?:.*$', line.strip()):
+            props = line.strip().split(':')[1].strip()
+            if re.search('Disabled', props):
+                dskcache = 'Disabled'
+            if re.search('Disk.s Default', props):
+                dskcache = 'Default'
+            if re.search('Enabled', props):
+                dskcache = 'Enabled'
+        if re.match(r'^Current Access Policy.*?:.*$', line.strip()):
+            props = line.strip().split(':')[1].strip()
+            if re.search('Read/Write', props):
+                dskaccess = 'RW'
+            if re.search('Read Only', props):
+                dskaccess = 'RO'
+            if re.search('Blocked', props):
+                dskaccess = 'Blocked'
+        if re.match(r'^Ongoing Progresses.*?:.*$', line.strip()):
+            operationlinennumber = linenumber
+        linenumber += 1
+        if operationlinennumber:
+            inprogress = output[operationlinennumber + 1]
+        else:
+            inprogress = 'None'
+    # Compute the RAID level
+    raidtype = raidType(spandepth, diskperspan, raidlvl)
+
+    dbgprint('RAID Level: %s Span Depth: %s Disk Per Span: %s Raid Type: %s' % (
+        raidlvl, spandepth, diskperspan, raidtype))
+
+    try:
+        osdisk = diskdict[controller_array_id]
+    except KeyError:
+        osdisk = "Notfound"
+    array = ArrayDB(int(controllerid), int(arrayid), controller_array_id, osdisk, raidtype, size, strpsz, properties, dskcache, state, targetid, inprogress, properties + properties2, dskaccess)
+    return array
+
+
+def diskTable(output, controllerid):
+    arrayid = -1
+    diskid = False
+    olddiskid = False
+    enclid = False
+    slotid = False
+    lsidid = 'Unknown'
+    PhDisk = namedtuple('PhDisk', ['cid',
+                                   'arrayid',
+                                   'spanid',
+                                   'armid',
+                                   'mtype',
+                                   'model',
+                                   'dsize',
+                                   'fstate',
+                                   'speed',
+                                   'temp',
+                                   'enclid',
+                                   'slotid',
+                                   'lsidid',
+                                   'hotspare',
+                                   'hotspare_type',
+                                   'foreign_state'])
+    table = []
+    fstate = 'Offline'
+    model = 'Unknown'
+    speed = 'Unknown'
+    mtype = 'Unknown'
+    dsize = 'Unknown'
+    temp = 'Unk0C'
+    arrayid = -1
+    armid = -1
+    spanid = -1
+    checknext = 0
+    hotspare = 0
+    hotspare_type = 'none'
+    foreign_state = 0
+    i = 0
+    for line in output:
+        if re.match(r'Enclosure Device ID: .*$', line.strip()):
+            # We match here early in the analysis so reset the vars if this is a new disk we're reading..
+            oldenclid = enclid
+            enclid = line.split(':')[1].strip()
+            if oldenclid:
+                arrayid = -1
+                spanid = -1
+                armid = -1
+                fstate = 'Offline'
+                model = 'Unknown'
+                speed = 'Unknown'
+                temp = 'Unk0C'
+                slotid = False
+                lsidid = 'Unknown'
+                hotspare_type = 'none'
+                hotspare = 0
+                foreign_state = 0
+        if re.match(r'^Coerced Size: ', line.strip()):
+            dsize = line.split(':')[1].strip()
+            dsize = re.sub(' \[.*\.*$', '', dsize)
+            dsize = re.sub('\..* GB*', '', dsize)
+            if re.search('TB', dsize):
+                dsize = re.sub('\.', '', dsize)
+                dsize = re.sub(' TB$', '', dsize)
+
+        if re.match(r'^Drive.s position: DiskGroup: [0-9]+,.*$', line.strip()):
+            arrayid = line.split(',')[0].split(':')[2].strip()
+            spanid = line.split(',')[1].split(':')[1].strip()
+            armid = line.split(',')[2].split(':')[1].strip()
+        if re.match(r'^Device Id: [0-9]+.*$', line.strip()):
+            diskid = line.split(':')[1].strip()
+        if re.match(r'^Device Id: .*$', line.strip()):
+            lsidid = line.split(':')[1].strip()
+        if re.match(r'Slot Number: .*$', line.strip()):
+            slotid = line.split(':')[1].strip()
+        if re.match(r'Firmware state: .*$', line.strip()):
+            fstate = line.split(':')[1].strip()
+            subfstate = re.sub('\(.*', '', fstate)
+        if re.match(r'Foreign State: .*$', line.strip()):
+            foreign_state = line.split(':')[1].strip()
+            if re.search('Foreign', foreign_state):
+                foreign_state = 1
+            else:
+                foreign_state = 0
+        if re.match(r'Inquiry Data: .*$', line.strip()):
+            model = line.split(':')[1].strip()
+            model = re.sub(' +', ' ', model)
+            manuf = re.sub(' .*', '', model)
+            dtype = re.sub(manuf + ' ', '', model)
+            dtype = re.sub(' .*', '', dtype)
+            # hwserial = re.sub('.*' + dtype + ' *', '', model)
+        if re.match(r'^Media Type: .*$', line.strip()):
+            mtype = line.split(':')[1].strip()
+            if mtype == 'Hard Disk Device':
+                mtype = 'HDD'
+            else:
+                if mtype == 'Solid State Device':
+                    mtype = 'SSD'
+                else:
+                    mtype = 'N/A'
+        if re.match(r'Device Speed: .*$', line.strip()):
+            speed = line.split(':')[1].strip()
+        if re.match(r'^Hotspare Information:', line.strip()):
+            checknext = i
+            hotspare = 1
+        if re.match(r'Type: .*$', line.strip()) and checknext == i - 1:
+            hotspare_type = line.split(',')[0].split(':')[1].strip()
+            checknext = i
+        if re.match(r'^Array #:', line.strip()) and checknext == i - 1:
+            arrayid = line.split(':')[1].strip()
+        if re.match(r'Drive Temperature :.*$', line.strip()):
+            temp = line.split(':')[1].strip()
+            temp = re.sub('\(.*\)', '', temp)
+        # Drive temp is amongst the last few lines matched, decide here if we add information to the table..
+            if arrayid == -1:
+                if subfstate == 'Unconfigured':
+                    dbgprint('Unconfigured Disk: Arrayid: %s DiskId: %s %s %s' % (arrayid, diskid, olddiskid, fstate))
+                if subfstate == 'Online, Spun Up':
+                    dbgprint('Online Disk: Arrayid: %s DiskId: %s %s %s' % (arrayid, diskid, olddiskid, fstate))
+                if fstate == "Hotspare, Spun Up":
+                    arrayid = -2
+                elif fstate == 'Unconfigured(good), Spun Up':
+                    fstate = 'Unconf, Spun Up'
+                elif fstate == 'Unconfigured(bad), Spun Up':
+                    fstate = 'Unconf(bad), Spun Up'
+                    arrayid = -3
+                elif fstate == 'JBOD':
+                    arrayid = -4
+                else:
+                    arrayid = -5
+                    fstate = 'Bad'
+            if fstate == "Hotspare, Spun Up":
+                fstate = 'HotSP, Spun Up'
+            phdisk = PhDisk(int(controllerid), int(arrayid), int(spanid), int(armid), mtype, model, int(dsize), fstate, speed, temp, int(enclid), int(slotid), int(lsidid), hotspare, hotspare_type, foreign_state)
+            table.append(phdisk)
+        i += 1
+    return table
+
+
+def raidType(spandepth, diskperspan, raidlvl):
+    if (int(spandepth) >= 2):
+        raidtype = "RAID-%s0" % raidlvl
+    else:
+        if(raidlvl == 1):
+            if(diskperspan > 2):
+                raidtype = "RAID-10"
+            else:
+                raidtype = "RAID-%s" % raidlvl
+        else:
+            raidtype = "RAID-%s" % raidlvl
+    return raidtype
+
+
+def checkForeign(fgrouptable):
+    for fdisk in fgrouptable.FDiskTable:
+        if fdisk.fstate == "Missing":
+            continue
+        for phdisk in diskdb:
+            if phdisk.cid == fdisk.cid and phdisk.lsidid == fdisk.lsidid:
+                dbgprint(str("Controller %s:%s Disk ID %s:%s Foreign %s" % (phdisk.cid, fdisk.cid, phdisk.lsidid, fdisk.lsidid, phdisk.foreign_state)))
+                if phdisk.foreign_state != 1:
+                    return False
+    return True
+
+
+def foreignTable(output, controllerid):
+    farraytable = []
+    fdisktable = []
+
+    FDiskTable = namedtuple('FDiskTable', ['cid',
+                                           'disk_group',
+                                           'disk_number',
+                                           'mtype',
+                                           'dsize',
+                                           'enclid',
+                                           'slotid',
+                                           'lsidid',
+                                           'fstate'])
+
+    FGroupTable = namedtuple('FGroupTable', ['cid',
+                                             'disk_group',
+                                             'targetid',
+                                             'raidlvl',
+                                             'raidtype',
+                                             'size',
+                                             'spandepth',
+                                             'state',
+                                             'diskperspan',
+                                             'FDiskTable'])
+
+    disk_group = False
+    targetid = 0
+    raidlvl = -1
+    size = 0
+    spandepth = 0
+    state = ""
+    diskperspan = 0
+
+    old_disk_number = False
+    disk_number = False
+    disk_count = 0
+    enclid = 0
+    lsidid = 0
+    slotid = 0
+    mtype = "N/A"
+    dsize = 0
+    fstate = "Missing"
+
+    reset_it = 0
+
+    for line in output:
+        if re.match(r'DISK GROUP: .*$', line.strip()) or re.match(r'SPANNED DISK GROUP: .*$', line.strip()):
+            # We match here early in the analysis so reset the vars if this is a new disk we're reading..
+            disk_group = int(line.split(':')[1].strip())
+            if reset_it == 1:
+                fdisktable = []
+                targetid = 0
+                raidlvl = -1
+                size = 0
+                spandepth = 0
+                state = ""
+                diskperspan = 0
+                fstate = "Missing"
+                disk_count = 0
+        if re.match(r'^Virtual Drive:.*(Target Id: [0-9]+).*$', line.strip()):
+            # Extract the SCSI Target ID
+            targetid = line.strip().split(':')[2].split(')')[0].strip()
+        if re.match(r'^RAID Level.*?:.*$', line.strip()):
+            # Extract the primary raid type, decide on X0 RAID level later when we hit Span Depth
+            raidlvl = int(line.strip().split(':')[1].split(',')[0].split('-')[1].strip())
+        if re.match(r'^Size.*?:.*$', line.strip()):
+            # Size reported in MB
+            if re.match(r'^.*MB$', line.strip().split(':')[1]):
+                size = line.strip().split(':')[1].strip('MB').strip()
+                if (float(size) > 1000):
+                    size = str(int(round(float(size) / 1000))) + 'G'
+                else:
+                    size = str(int(round(float(size)))) + 'M'
+            # Size reported in TB
+            elif re.match(r'^.*TB$', line.strip().split(':')[1]):
+                size = line.strip().split(':')[1].strip('TB').strip()
+                size = str(int(round(float(size) * 1000))) + 'G'
+            # Size reported in GB (default)
+            else:
+                size = line.strip().split(':')[1].strip('GB').strip()
+                size = str(int(round(float(size)))) + 'G'
+        if re.match(r'^Span Depth.*?:.*$', line.strip()):
+            # If Span Depth is greater than 1 chances are we have a RAID 10, 50 or 60
+            spandepth = int(line.strip().split(':')[1].strip())
+        if re.match(r'^State.*?:.*$', line.strip()):
+            state = line.strip().split(':')[1].strip()
+        if re.match(r'^Number Of Drives.*:.*$', line.strip()):
+            diskperspan = int(line.strip().split(':')[1].strip())
+
+        ################################################
+
+        if re.match(r'^Physical Disk: .*$', line.strip()):
+            disk_count += 1
+            old_disk_number = disk_number
+            disk_number = int(line.split(':')[1].strip())
+            if old_disk_number:
+                enclid = 0
+                lsidid = 0
+                slotid = 0
+                mtype = "N/A"
+                dsize = 0
+            # It's safe to calculate raid type no
+            # Compute the RAID level
+            raidtype = raidType(spandepth, diskperspan, raidlvl)
+        if re.match(r'Enclosure Device ID: .*$', line.strip()):
+            # We match here early in the analysis so reset the vars if this is a new disk we're reading..
+            enclid = line.split(':')[1].strip()
+        if re.match(r'^Device Id: .*$', line.strip()):
+            lsidid = line.split(':')[1].strip()
+        if re.match(r'Slot Number: .*$', line.strip()):
+            slotid = line.split(':')[1].strip()
+        if re.match(r'Firmware state: .*$', line.strip()):
+            fstate = line.split(':')[1].strip()
+        if re.match(r'^Media Type: .*$', line.strip()):
+            mtype = line.split(':')[1].strip()
+            if mtype == 'Hard Disk Device':
+                mtype = 'HDD'
+            else:
+                if mtype == 'Solid State Device':
+                    mtype = 'SSD'
+                else:
+                    mtype = 'N/A'
+        if re.match(r'^Coerced Size: ', line.strip()):
+            dsize = line.split(':')[1].strip()
+            dsize = re.sub(' \[.*\.*$', '', dsize)
+            dsize = re.sub('\..* GB*', '', dsize)
+            if re.search('TB', dsize):
+                dsize = re.sub('\.', '', dsize)
+                dsize = re.sub(' TB$', '', dsize)
+
+        if re.match(r'Drive Temperature :.*$', line.strip()):
+            if disk_count == (diskperspan * spandepth):
+                table = FDiskTable(int(controllerid), int(disk_group), int(disk_number), mtype, int(dsize), int(enclid), int(slotid), int(lsidid), fstate)
+                fdisktable.append(table)
+                gtable = FGroupTable(int(controllerid), int(disk_group), int(targetid), raidlvl, raidtype, size, int(spandepth), state, int(diskperspan), fdisktable)
+
+                if checkForeign(gtable):
+                    farraytable.append(gtable)
+                reset_it = 1
+            else:
+                table = FDiskTable(int(controllerid), int(disk_group), int(disk_number), mtype, int(dsize), int(enclid), int(slotid), int(lsidid), fstate)
+                fdisktable.append(table)
+
+        if re.match(r'^This Physical Disk is Missing.$', line.strip()):
+            fstate = "Missing"
+            if disk_count == (diskperspan * spandepth):
+                table = FDiskTable(int(controllerid), int(disk_group), int(disk_number), mtype, int(dsize), int(enclid), int(slotid), int(lsidid), fstate)
+                fdisktable.append(table)
+                gtable = FGroupTable(int(controllerid), int(disk_group), int(targetid), raidlvl, raidtype, size, int(spandepth), state, int(diskperspan), fdisktable)
+
+                if checkForeign(gtable):
+                    farraytable.append(gtable)
+                reset_it = 1
+            else:
+                table = FDiskTable(int(controllerid), int(disk_group), int(disk_number), mtype, int(dsize), int(enclid), int(slotid), int(lsidid), fstate)
+                fdisktable.append(table)
+    return farraytable
+
+
+def missingTable(output, controllerid):
+    missingtable = []
+    is_missing = False
+    for line in output:
+        if re.match('^[0-9] .*$', line.strip()):
+            is_missing = True
+            # missing_disk = int(re.split('\s+', line.strip())[0].strip())
+            missing_disk_array = int(re.split('\s+', line.strip())[1].strip())
+            missing_disk_row = int(re.split('\s+', line.strip())[2].strip())
+            missingtable.append([controllerid, missing_disk_array, missing_disk_row])
+    if is_missing:
+        return missingtable
+    return
+
+
+def parseControllerDefaults(output, cid):
+    max_strip_size = 0
+    min_strip_size = 0
+    default_strip_size = 0
+    access_policy_allowed = False
+    read_policy_allowed = False
+    write_policy_allowed = False
+    check_next_read = 0
+    check_next_write = 0
+    default_read_policy = ''
+    default_write_policy = ''
+    io_policy_allowed = False
+    default_io_policy = 'Direct'
+    disk_cache_policy_allowed = False
+    default_bbu_cache = False
+    Ctrl_Defaults = namedtuple('Ctrl_Defaults', ['cid',
+                                                 'max_strip_size',
+                                                 'min_strip_size',
+                                                 'default_strip_size',
+                                                 'access_policy_allowed',
+                                                 'read_policy_allowed',
+                                                 'default_read_policy',
+                                                 'write_policy_allowed',
+                                                 'default_write_policy',
+                                                 'default_bbu_cache',
+                                                 'io_policy_allowed',
+                                                 'default_io_policy',
+                                                 'disk_cache_policy_allowed'])
+    for line in output:
+        if re.match(r'^Min Strip Size.*$', line.strip()):
+            # line = "Max Strip Size           : 1.0 MB"
+            value = line.split(':')[1].strip().split(' ')[0]
+            times = 1
+            if re.search('MB', line):
+                times = 1024
+                value = line.split(':')[1].strip().split(' ')[0].split('.')[0]
+            min_strip_size = int(value) * times
+        if re.match(r'^Max Strip Size.*$', line.strip()):
+            value = line.split(':')[1].strip().split(' ')[0]
+            times = 1
+            if re.search('MB', line):
+                times = 1024
+                value = line.split(':')[1].strip().split(' ')[0].split('.')[0]
+            max_strip_size = int(value) * times
+        if re.match(r'^Strip Size.*$', line.strip()):
+            value = line.split(':')[1].strip().split(' ')[0]
+            times = 1
+            if re.search('mB', line):
+                times = 1024
+                value = value.replace('mB', '')
+            else:
+                value = value.replace('kB', '')
+            default_strip_size = int(value) * times
+        if re.match(r'^Access Policy.*$', line.strip()):
+            value = line.split(':')[1].strip()
+            if re.search('Yes', value):
+                access_policy_allowed = True
+        if re.match(r'^Read Policy.*$', line.strip()) and check_next_read == 0:
+            value = line.split(':')[1].strip()
+            if re.search('Yes', value):
+                read_policy_allowed = True
+            check_next_read = 1
+        if re.match(r'^Read Policy.*$', line.strip()) and check_next_read == 1:
+            value = line.split(':')[1].strip()
+            default_read_policy = value
+        if re.match(r'^Write Policy.*$', line.strip()) and check_next_write == 0:
+            value = line.split(':')[1].strip()
+            if re.search('Yes', value):
+                write_policy_allowed = True
+            check_next_write = 1
+        if re.match(r'^Write Policy.*$', line.strip()) and check_next_write == 1:
+            value = line.split(':')[1].strip()
+            default_write_policy = value
+        if re.match(r'^IO Policy.*$', line.strip()):
+            value = line.split(':')[1].strip()
+            if re.search('Yes', value):
+                io_policy_allowed = True
+        if re.match(r'^Cached IO.*$', line.strip()):
+            value = line.split(':')[1].strip()
+            if re.search('Yes', value):
+                default_io_policy = 'Cached'
+        if re.match(r'^Disk Cache Policy.*$', line.strip()):
+            value = line.split(':')[1].strip()
+            if re.search('Yes', value):
+                disk_cache_policy_allowed = True
+        if re.match(r'^Cache When BBU Bad.*$', line.strip()):
+            value = line.split(':')[1].strip()
+            if re.search('Disabled', value):
+                default_bbu_cache = False
+            else:
+                default_bbu_cache = True
+        if re.match(r'^Exit Code.*$', line.strip()):
+            # End of file lets return the table
+            ctrl_defaults = Ctrl_Defaults(cid, max_strip_size, min_strip_size, default_strip_size, access_policy_allowed, read_policy_allowed, default_read_policy, write_policy_allowed, default_write_policy, default_bbu_cache, io_policy_allowed, default_io_policy, disk_cache_policy_allowed)
+            return ctrl_defaults
+
+
+def getControllerDefaults():
+    global controller_defaults
+    controller_defaults = []
+    controllerid = 0
+    while controllerid < controllernumber:
+        cmd = '%s -AdpAllInfo -a%d -NoLog' % (megaclipath, controllerid)
+        output = getOutput(cmd)
+        controller_defaults.append(parseControllerDefaults(output, controllerid))
+        controllerid += 1
+
+
+def printControllers():
+    # List available controller
+    # Get this to used controllerdb and expand controllerdb in the scan
+
+    if controllernumber:
+        print getFormat('<b>-- <u>Controller Information</u> --</n>')
+        i = 0
+        mlen = 0
+        mlen = returnWdthFromArrayOfNamedTupleField(controllerdb, "controller_type")
+        for hba in controllerdb:
+            hbafmt = str('%-3s | %-' + str(mlen) + 's | %-6s | %-4s | %-12s ')
+            # Header
+            if (i == 0):
+                string = hbafmt % ("ID", "H/W Model", "RAM", "Temp", "Firmware")
+                print getFormat("<b>%s</n>" % string)
+            print hbafmt % (
+                hba.controller_string,
+                hba.controller_type,
+                hba.memory,
+                hba.temp,
+                hba.fw_version)
+            i += 1
+        print ''
+    else:
+        print "No MegaRAID or PERC adapter detected on your system!"
+        exit(1)
+
+
+def printArrays(with_disks):
+
+    print getFormat('<b>-- <u>Array Information</u> --</n>')
+    controllerid = 0
+    while controllerid < controllernumber:
+        printArraysByController(controllerid, with_disks)
+        controllerid += 1
+    print ''
+
+
+def printArrayListsByController(controllerid, array_list, with_disks):
+    ldfmt = str('%-5s | %-7s | %7s | %7s | %10s | %8s | %8s | %8s | %-12s ')
+    i = 0
+    for array_to_print in array_list:
+        for array in arraydb:
+            if array.cid == controllerid and array.arrayid == array_to_print:
+                if with_disks or (not with_disks and i == 0):
+                    string = ldfmt % ("-- ID", "Type", "Size", "Strpsz", "Flags", "DskCache", "Status", "OS Disk", "InProgress")
+                    print getFormat("<b>%s</n>" % string)
+                if array.state != "Optimal":
+                    state = getFormat("<b><r><bl><bg_green><red>%s</n>" % array.state)
+                else:
+                    state = array.state
+                print ldfmt % (
+                    array.controller_array_id,
+                    array.raidtype,
+                    array.size,
+                    array.strpsz,
+                    array.properties,
+                    array.dskcache,
+                    state,
+                    array.osdisk,
+                    array.inprogress)
+                # if not array.state == 'Optimal':
+                #     bad = True
+                if with_disks:
+                    printUsedDisksByControllerArray(controllerid, array.arrayid)
+                    print ''
+                i += 1
+
+
+def printArraysByController(controllerid, with_disks):
+    ldfmt = str('%-5s | %-7s | %7s | %7s | %10s | %8s | %8s | %8s | %-12s ')
+    i = 0
+    for array in arraydb:
+        if array.cid == controllerid:
+            if with_disks or (not with_disks and i == 0):
+                string = ldfmt % ("-- ID", "Type", "Size", "Strpsz", "Flags", "DskCache", "Status", "OS Disk", "InProgress")
+                print getFormat("<b><u>%s</u></n>" % string)
+            if array.state != "Optimal":
+                state = getFormat("<b><r><bl><bg_green><red>%s</n>" % array.state)
+            else:
+                state = array.state
+            print ldfmt % (
+                array.controller_array_id,
+                array.raidtype,
+                array.size,
+                array.strpsz,
+                array.properties,
+                array.dskcache,
+                state,
+                array.osdisk,
+                array.inprogress)
+            # if not array.state == 'Optimal':
+            #     bad = True
+            if with_disks:
+                printUsedDisksByControllerArray(controllerid, array.arrayid)
+                print ''
+            i += 1
+
+
+def printUsedDisks():
+    if totaldrivenumber:
+        print getFormat('<b>-- <u>Disk Information</u> --</n>')
+
+        controllerid = 0
+        while controllerid < controllernumber:
+            printUsedDisksByController(controllerid)
+            controllerid += 1
+        print ''
+
+
+def printUsedDisksByController(controllerid):
+    drvfmt = "%-8s | %-4s | %-8s | %-15s | %-8s | %-8s | %-8s"
+    i = 0
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.arrayid < 0:
+            # Header
+            if (i == 0):
+                string = drvfmt % ("-- ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Dev ID")
+                print getFormat("<b>%s</n>" % string)
+            # Drive information
+            if phdisk.hotspare == 1:
+                diskstring = "c%sa%ssXaY" % (controllerid, phdisk.arrayid)
+            else:
+                diskstring = "c%sa%ss%sa%s" % (controllerid, phdisk.arrayid, phdisk.spanid, phdisk.armid)
+            print drvfmt % (
+                diskstring,
+                phdisk.mtype,
+                phdisk.dsize,
+                phdisk.fstate,
+                phdisk.speed,
+                str('[' + str(phdisk.enclid) + ':' + str(phdisk.slotid) + ']'),
+                phdisk.lsidid)
+            i = i + 1
+
+
+def printUsedDisksByControllerArrayWithIdFirst(controllerid, arrayid):
+    drvfmt = "%-8s | %-8s | %-4s | %-8s | %-15s | %-8s | %-8s "
+    i = 0
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and str(phdisk.arrayid) == str(arrayid):
+            # Header
+            if (i == 0):
+                string = drvfmt % ("Disk ID", "-- ID", "Type", "Size Gb", "Status", "Speed", "Slot ID")
+                print getFormat("<b>%s</n>" % string)
+            # Drive information
+            if phdisk.hotspare == 1:
+                diskstring = "c%sa%ssXaY" % (controllerid, phdisk.arrayid)
+            else:
+                diskstring = "c%sa%ss%sa%s" % (controllerid, phdisk.arrayid, phdisk.spanid, phdisk.armid)
+            print drvfmt % (
+                phdisk.lsidid,
+                diskstring,
+                phdisk.mtype,
+                phdisk.dsize,
+                phdisk.fstate,
+                phdisk.speed,
+                "[%s:%s]" % (phdisk.enclid, phdisk.slotid))
+            i = i + 1
+
+
+def printUsedDisksByControllerArray(controllerid, arrayid):
+    drvfmt = "%-8s | %-4s | %-8s | %-15s | %-8s | %-8s | %-8s"
+    i = 0
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and str(phdisk.arrayid) == str(arrayid):
+            # Header
+            if (i == 0):
+                string = drvfmt % ("-- ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Disk ID")
+                print getFormat("<b>%s</n>" % string)
+            # Drive information
+            if phdisk.hotspare == 1:
+                diskstring = "c%sa%ssXaY" % (controllerid, phdisk.arrayid)
+            else:
+                diskstring = "c%sa%ss%sa%s" % (controllerid, phdisk.arrayid, phdisk.spanid, phdisk.armid)
+            print drvfmt % (
+                diskstring,
+                phdisk.mtype,
+                phdisk.dsize,
+                phdisk.fstate,
+                phdisk.speed,
+                "[%s:%s]" % (phdisk.enclid, phdisk.slotid),
+                phdisk.lsidid)
+            i = i + 1
+
+
+def printAvailableDisks():
+    if totalunconfdrivenumber:
+        print getFormat('<b>-- <u>Unconfigured Disk Information</u> --</n>')
+        controllerid = 0
+        while controllerid < controllernumber:
+            printAvailableDiskByController(controllerid, False)
+            controllerid += 1
+        print ''
+
+
+def printAvailableDiskByController(controllerid, id_first):
+    if id_first:
+        drvfmt = "%-10s | %-8s | %-4s | %-8s | %-15s | %-8s | %-8s "
+    else:
+        drvfmt = "%-8s | %-4s | %-8s | %-15s | %-8s | %-8s | %-8s "
+    i = 0
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.arrayid == -1:
+
+            # Header
+            if (i == 0):
+                if id_first:
+                    string = drvfmt % ("-- Disk ID", "ID", "Type", "Size Gb", "Status", "Speed", "Slot ID")
+                    print getFormat("<b>%s</n>" % string)
+                else:
+                    string = drvfmt % ("-- ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Disk ID")
+                    print getFormat("<b>%s</n>" % string)
+            # Drive information
+            if id_first:
+                print drvfmt % (
+                    phdisk.lsidid,
+                    str('c' + str(controllerid) + 'aXsYaZ'),
+                    phdisk.mtype,
+                    phdisk.dsize,
+                    phdisk.fstate,
+                    phdisk.speed,
+                    "[%s:%s]" % (phdisk.enclid, phdisk.slotid))
+            else:
+                print drvfmt % (
+                    str('c' + str(controllerid) + 'aXsYaZ'),
+                    phdisk.mtype,
+                    phdisk.dsize,
+                    phdisk.fstate,
+                    phdisk.speed,
+                    "[%s:%s]" % (phdisk.enclid, phdisk.slotid),
+                    phdisk.lsidid)
+            i = i + 1
+
+
+def getDisksByController(controllerid):
+    free_disks = []
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.arrayid == -1:
+            free_disks.append(phdisk.lsidid)
+    return free_disks
+
+
+def printOtherDisks():
+    for phdisk in diskdb:
+        if phdisk.arrayid <= -2:
+            break
+    else:
+        return
+    print getFormat('<b>-- <u>Misc Disk Information</u> --</n>')
+    controllerid = 0
+    while controllerid < controllernumber:
+        printOtherDiskByController(controllerid)
+        controllerid += 1
+    print ''
+
+
+def printOtherDiskByController(controllerid):
+    drvfmt = "%-8s | %-4s | %-8s | %-15s | %-8s | %-8s | %-8s"
+    i = 0
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.arrayid <= -2:
+
+            # Header
+            if (i == 0):
+                string = drvfmt % ("ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Disk  ID")
+                print ("<b>%s</n>" % string)
+            # Drive information
+            print drvfmt % (
+                str('c' + str(controllerid) + 'aXsYaZ'),
+                phdisk.mtype,
+                phdisk.dsize,
+                phdisk.fstate,
+                phdisk.speed,
+                "[%s:%s]" % (phdisk.enclid, phdisk.slotid),
+                phdisk.lsidid)
+            i = i + 1
+
+
+def setArrayOptions(controllerid, arrayid, creation):
+    if creation:
+        print
+        print "Some settings are only possible to set after the array is created"
+        print getFormat("Please use <b>Configure Array</n> in the main menu to set those settings")
+        print "after the array been created"
+        print
+
+    controller_default = controller_defaults[controllerid]
+    options = []
+    ochoice = ''
+
+    if not creation:
+        for array in arraydb:
+            if array.cid == controllerid and arrayid == array.arrayid:
+                current_array = array._make(array)
+
+    if not creation and controller_default.access_policy_allowed:
+        # Access Policy:
+        # Access Policy supported yes/no
+        # RW: Allow read/write access (default)
+        # RO: Allow read only
+        # Blocked: Do not allow access.
+        # -RW|RO|Blocked|RemoveBlocked
+        ochoice = ''
+        while True:
+            print
+            print getFormat(" Access Policy, current access policy is <b>%s</n>" % current_array.dskaccess)
+            print
+            print " To unblock a blocked drive select RW or RO this will unblock a previously blocked drive"
+            print
+            print getFormat(" <b>RW</n>) ReadWrite")
+            print getFormat(" <b>RO</n>) ReadOnly")
+            print getFormat(" <b>B</n>) Block")
+            print
+            print getFormat(" <b>Enter</n>) %s" % current_array.dskaccess)
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            ochoice = raw_input(prompt)
+            print
+            if re.match('RW|ReadWrite', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' -RW'))
+                break
+            elif re.match('RO|ReadOnly', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' -RO'))
+                break
+            elif re.match('B|Blocked', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' -Blocked'))
+                break
+            elif re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+                return [-1]
+            elif re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                break
+            else:
+                print "%s is not a valid choice" % ochoice
+
+    # Read Policy:
+    # NORA (No read ahead), RA (Read ahead), ADRA (Adaptive read ahead):
+    # Nora, best for file access that is mainly random (this should be your setting on SSD)
+    # Read ahead best for file access that is mainly sequntial
+    # Adaptive Read ahead, if the two latest file access are sequential then it turns on read ahead, just to turn it off when disc access goes back to be random. This is most likely what you want for most cases.
+
+    ochoice = ''
+    if controller_default.read_policy_allowed:
+        while True:
+            print
+            if creation:
+                current_default_value = controller_default.default_read_policy
+                print getFormat("Select Read Policy, default is <b>%s</n>:" % current_default_value)
+            else:
+                current_default_value = current_array.all_properties.split(',')[0]
+                print getFormat("Select Read Policy, current value is <b>%s</n>:" % current_default_value)
+            print
+            print "NORA, best for file access that is mainly random, recomended on SSD drives"
+            print "RA, best for file access that is higly sequential"
+            print "ADRA, if two last file access was sequential, RA will be turned on until file access again becomes random"
+            print
+            print getFormat(" <b>NORA</n>)  No Read Ahead")
+            print getFormat(" <b>RA</n>)    Read Ahead")
+            print getFormat(" <b>ADRA</n>)  Adaptive Read Ahead")
+            print
+            print getFormat(" <b>Enter</n>) %s" % current_default_value)
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            ochoice = raw_input(prompt)
+            print
+            if re.match('N|NORA', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' NORA'))
+                break
+            elif re.match('R|RA', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' RA'))
+                break
+            elif re.match('A|ADRA', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' ADRA'))
+                break
+            elif re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+                return [-1]
+            elif re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                break
+            else:
+                print "%s is not a valid choice" % ochoice
+
+    # IO Read Policy, doesn't affect ReadAhead
+    # Direct :In direct I/O mode, reads are not buffered in cache memory. Data is transferred to the cache and the host concurrently. If the same data block is read again, it comes from cache memory. This is the default, and in nearly all cases the best.
+    # Cached : In cached I/O mode, all reads are buffered in cache memory, then it's feed to the host, you don't want this unless you have some very specific needs with small files that are accessed and then accessed again.
+    # io_policy_allowed, default_io_policy controller_default 10 11
+    ochoice = ''
+    if controller_default.io_policy_allowed:
+        while True:
+            if creation:
+                current_default_value = controller_default.default_io_policy
+                print getFormat("Select Read Cache Policy, default is <b>%s</n>:" % current_default_value)
+            else:
+                current_default_value = current_array.all_properties.split(',')[3]
+                print getFormat("Select Read Cache Policy, current value is <b>%s</n>:" % current_default_value)
+            print
+            print getFormat("<b>NOTE</n>: This option has nothing to do with Read Ahead and it's possible cache")
+            print "Direct: Reads are not buffered, read is trasfered to host and read cache concurrently."
+            print "Cached: All reads are first transferred to the cache, then transferred to the host from the cache"
+            print
+            print getFormat(" <b>D</n>) Direct")
+            print getFormat(" <b>C</n>) Cached")
+            print
+            print getFormat(" <b>Enter</n>) %s" % current_default_value)
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            ochoice = raw_input(prompt)
+            print
+            if re.match('D|Direct', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' Direct'))
+                break
+            elif re.match('C|Cached', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' Cached'))
+                break
+            elif re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+                return [-1]
+            elif re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                break
+            else:
+                print "%s is not a valid choice" % ochoice
+
+    # Write Policy
+    # WT (Write through), WB (Write back (default)) NOTE: Warn about Battery
+    # ForcedWB can only be applied after array is created (weird)
+    ochoice = ''
+    if controller_default.write_policy_allowed:
+        while True:
+            if creation:
+                current_default_value = controller_default.default_write_policy
+                print getFormat("Select Write Policy, default is <b>%s</n>:" % current_default_value)
+            else:
+                current_default_value = current_array.all_properties.split(',')[1]
+                print getFormat("Select Write Policy, return for current <b>%s</n>:" % current_default_value)
+            print
+            print "Write Through, when the physical drives has received all data completion signal is sent to the host"
+            print "Write Back, when the controller has received all data completion signal is sent to the host"
+            print
+            print getFormat(" <b>WT</n>) Write Trough")
+            print getFormat(" <b>WB</n>) Write Back")
+            print
+            print getFormat(" <b>Enter</n>) %s" % current_default_value)
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            ochoice = raw_input(prompt)
+            print
+            if re.match('WT', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' WT'))
+                break
+            elif re.match('WB', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' WB'))
+                break
+            elif re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+                return [-1]
+            elif re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                break
+            else:
+                print "%s is not a valid choice" % ochoice
+
+    # Bad BBU, in case of bad Battery backup, use cache for Write through, i.e. swith to Write back in case of bad battery
+    # CachedBadBBU , NoCachedBadBBU default_bbu_cache (bool) controller_default.default_bbu_cache
+    ochoice = ''
+    if controller_default.default_bbu_cache:
+        default_bbu_string = 'CachedBadBBU'
+    else:
+        default_bbu_string = 'NoCachedBadBBU'
+
+    while True:
+        if creation:
+            current_default_value = default_bbu_string
+            print getFormat("Select Write Cache Policy for faulty or missing cache backup battery No/Yes, default <b>%s</n>:" % current_default_value)
+        else:
+            current_default_value = current_array.all_properties.split(',')[2]
+            print getFormat("Select Write Cache Policy for faulty or missing cache backup battery No/Yes, current <b>%s</n>:" % current_default_value)
+        print
+        print "No (NoCachedBadBBU), will not use write cache when faulty or missing cache backup battery on controller"
+        print "Yes (CachedBadBBU) will force use of cache even when faulty or missing cache backup battery on controller"
+        print
+        print getFormat(" <b>No</n>)   NoCachedBadBBU")
+        print getFormat(" <b>Yes</n>)  CachedBadBBU")
+        print
+        print getFormat(" <b>Enter</n>) %s" % current_default_value)
+        print getFormat(" <b>Q</n>uit) Quit")
+        print
+        ochoice = raw_input(prompt)
+        print
+        if re.match('Y|Yes', '%s' % ochoice, re.IGNORECASE):
+            options.append(str(' CachedBadBBU'))
+            break
+        elif re.match('N|No', '%s' % ochoice, re.IGNORECASE):
+            options.append(str(' NoCachedBadBBU'))
+            break
+        elif re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+            return [-1]
+        elif re.match('^$', '%s' % ochoice, re.IGNORECASE):
+            break
+        else:
+            print "%s is not a valid choice" % ochoice
+
+    # Drive Cache Note the default is the default of the disk which isn't avalible to us through the
+    # Enable: Enable the drive cache. Should be enabled on SSD drives
+    # Disable: Disable the drive cache, you might exprience preformace degradation but it will be safer writes since if you loose power to the disks you will lose the date that was in the cache buffer.
+    ochoice = ''
+    if controller_default.disk_cache_policy_allowed and not creation:
+        while True:
+            current_default_value = current_array.dskcache
+            print getFormat("Select Disk Cache Policy, Enable, Disable, current is <b>%s</n>" % current_default_value)
+            print "Disks own Default, can't be determined at this point"
+            print "Disable (DisDskCache), disables the disks built in cache, recomended on all HDD"
+            print "Enable (EnDskCache), enables the disks built in cache, recomended on all SSD"
+            print
+            print getFormat(" <b>D</n>isable) DisDskCache")
+            print getFormat(" <b>E</n>enable) EnDskCache")
+            print
+            print getFormat(" <b>Enter</n>) %s" % current_default_value)
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            ochoice = raw_input(prompt)
+            print
+            if re.match('D|Disable', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' -DisDskCache'))
+                break
+            elif re.match('E|Enable', '%s' % ochoice, re.IGNORECASE):
+                options.append(str(' -EnDskCache'))
+                break
+            elif re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+                return [-1]
+            elif re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                break
+            else:
+                print "%s is not a valid choice" % ochoice
+                continue
+
+    if creation:
+        # Strip size in kb
+        strpsz = [8, 16, 32, 64, 128, 256, 512, 1024]
+        del strpsz[:strpsz.index(controller_default.min_strip_size)]
+        del strpsz[strpsz.index(controller_default.max_strip_size) + 1:]
+
+        ochoice = ''
+        strpsz_copy = list(strpsz)
+        last_sz = strpsz_copy.pop()
+        while True:
+            current_default_value = controller_default.default_strip_size
+            print getFormat("Select Stripe size, default is <b>%s</n> KB:" % current_default_value)
+            print
+            if len(strpsz_copy) == 0:
+                print last_sz + ' KB'
+            else:
+                print ', '.join(str(x) for x in strpsz_copy) + " or " + str(last_sz) + ' KB'
+            print
+            print getFormat(" <b>Enter</n>) %s" % current_default_value)
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            ochoice = raw_input(prompt)
+            print
+            if not re.match('q|quit', '%s' % ochoice, re.IGNORECASE) and not re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                try:
+                    stripe_choice = int(ochoice.strip())
+                except ValueError:
+                    print "Invalid value"
+                    print
+                    continue
+                try:
+                    strpsz.index(stripe_choice)
+                    options.append(str(' -strpsz' + str(stripe_choice)))
+                    break
+                except ValueError:  # Exception as ex:
+                    # template = "An exception of type {0} occured. Arguments:\n{1!r}"
+                    # message = template.format(type(ex).__name__, ex.args)
+                    # print message
+                    print "Stripe size of %d KB it not a valid selection" % stripe_choice
+                    print
+                    continue
+            if re.match('q|quit', '%s' % ochoice, re.IGNORECASE):
+                return [-1]
+            if re.match('^$', '%s' % ochoice, re.IGNORECASE):
+                break
+    return options
+    # Power savings options Not yet supported
+    # -Default| -Automatic| -None| -Maximum| -MaximumWithoutCaching
+
+
+def getArrays():
+    global totalarraynumber
+    global arraydb
+    arraydb = []
+    controllerid = 0
+    totalarraynumber = 0
+    arraynumber = 0
+    LDTable = [[] * 16 for itable in range(16)]
+
+    while controllerid < controllernumber:
+        arrayid = 0
+
+        cmd = '%s -LDInfo -lall -a%d -NoLog' % (megaclipath, controllerid)
+        output = getOutput(cmd)
+        arraynumber = returnArrayNumber(output)
+
+        # We need to explore each HBA to look for gaps in LD's
+        ldid = 0
+        ldcount = 0
+        while ldcount < arraynumber:
+            cmd = '%s -LDInfo -l%d -a%d -NoLog' % (megaclipath, ldid, controllerid)
+            output = getOutput(cmd)
+            for line in output:
+                if re.match(r'^Adapter.*Virtual Drive .* Does not Exist', line.strip()):
+                    ldid += 1
+                if re.match(r'^Virtual Drive:', line.strip()):
+                    LDTable[controllerid].append(ldid)
+                    ldcount += 1
+                    ldid += 1
+        while arrayid < arraynumber:
+            ldid = LDTable[controllerid][arrayid]
+            cmd = '%s -LDInfo -l%d -a%d -NoLog' % (megaclipath, ldid, controllerid)
+            output = getOutput(cmd)
+            arraydb.append(arrayTable(output, controllerid, ldid))
+            arrayid += 1
+            totalarraynumber += 1
+
+        controllerid += 1
+
+
+def getDisks():
+    global diskdb
+    global totaldrivenumber
+    global totalunconfdrivenumber
+    diskdb = []
+
+    controllerid = 0
+    while controllerid < controllernumber:
+        cmd = '%s -PDList -a%d -NoLog' % (megaclipath, controllerid)
+        output = getOutput(cmd)
+        diskdb.extend(diskTable(output, controllerid))
+        controllerid += 1
+
+    for phdisk in diskdb:
+        if phdisk.arrayid == -1:
+            totalunconfdrivenumber += 1
+
+    # Rewrite to use diskdb
+    controllerid = 0
+    while controllerid < controllernumber:
+        cmd = '%s -PDGetNum -a%d -NoLog' % (megaclipath, controllerid)
+        output = getOutput(cmd)
+        totaldrivenumber += returnTotalDriveNumber(output)
+        controllerid += 1
+
+
+def getControllers():
+    global controllerdb
+    controllerdb = []
+
+    HBA_Card = namedtuple('HBA_Card', ['cid',
+                                       'controller_string',
+                                       'controller_type',
+                                       'memory',
+                                       'temp',
+                                       'fw_version',
+                                       'used_disk',
+                                       'avalible_disk',
+                                       'hotspare_disk',
+                                       'unconf_bad_disk',
+                                       'jbod_disk',
+                                       'bad_disk',
+                                       'foreign_disk'])
+
+    controllerid = 0
+    while controllerid < controllernumber:
+
+        controllermodel = 'Unknown'
+        controllerram = 'Unknown'
+        controllerrev = 'Unknown'
+        controllertemp = ''
+        controllerstring = ''
+        used_disk = 0
+        avalible_disk = 0
+        hotspare_disk = 0
+        unconf_bad_disk = 0
+        jbod_disk = 0
+        bad_disk = 0
+        foreign_disk = 0
+
+        cmd = '%s -AdpAllInfo -a%d -NoLog' % (megaclipath, controllerid)
+        output = getOutput(cmd)
+
+        controllermodel = returnControllerModel(output)
+        controllerram = returnMemorySize(output)
+        controllertemp = returnROCTemp(output)
+        controllerrev = "FW: %s" % returnFirmwareVersion(output)
+
+        controllerstring = "c%s" % controllerid
+
+        for phdisk in diskdb:
+            if phdisk.cid == controllerid:
+                if phdisk.arrayid == -1:  # Avalible disk
+                    avalible_disk += 1
+                elif phdisk.arrayid == -2:  # HotSpare
+                    hotspare_disk += 1
+                elif phdisk.arrayid == -3:  # Unconf bad
+                    unconf_bad_disk += 1
+                elif phdisk.arrayid == -4:  # JBOD
+                    jbod_disk += 1
+                elif phdisk.arrayid == -5:  # Bad or somethings
+                    bad_disk += 1
+                else:  # Used
+                    used_disk += 1
+                if phdisk.foreign_state:
+                    foreign_disk += 1
+
+        hba_card = HBA_Card(controllerid, controllerstring, controllermodel, controllerram, controllertemp, controllerrev, used_disk, avalible_disk, hotspare_disk, unconf_bad_disk, jbod_disk, bad_disk, foreign_disk)
+        controllerdb.append(hba_card)
+
+        controllerid += 1
+
+
+def scan():
+    osMap()
+    getDisks()
+    getArrays()
+    getControllers()
+
+
+def freeInDiskdb(controllerid, lsiid):
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.lsidid == lsiid and phdisk.arrayid == -1:
+            return True
+    return False
+
+
+def freeDiskonCtrl(controllerid):
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.arrayid == -1:
+            return True
+    return False
+
+
+def getDiskSize(controllerid, lsiid):
+    for phdisk in diskdb:
+        if phdisk.cid == controllerid and phdisk.lsidid == lsiid:
+            return phdisk.dsize
+    return -1
+
+
+def checkSpanRaidSizes(raidtype, numberofdisks, size):
+    # Ok so if you want spans you need at least two span, hence at least half the disks in each span, so you start at modulostart i.e. number of disks / 2 + 1
+    modulostart = numberofdisks / 2 + 1
+    raidsetups = []
+    # so you setup a range going backwards from modulostart to, min number of disks you need in a span it's 4 for raid 6 and 3 for raid 5 i.e. "raid type" - 2 (you need 3 to mark the end of the array), -1 is for backwards.
+    for x in range(modulostart, raidtype - 3, -1):
+        if not numberofdisks % x:
+            # Only when your make a division without a reminder you will have the same  number of disks in each span
+            physical_disks = x
+            # The number of spans  is the total number of disks divided by number of disks in each span
+            spans = numberofdisks / x
+            # size of each span is the all disk minus the wasted disks for parity, in raid six its two disks (raidtype - 4) raid 5 its one disks (raid type -4)
+            spansize = size * (physical_disks - (raidtype - 4))
+            totalsize = spans * spansize
+            #loss is the number of spans times number of disks wasted as per above
+            lost = spans * size * (raidtype - 4)
+            # It's simples as a meerkat can get, see http://www.comparethemeerkat.com/
+            raidsetups.append([spans, physical_disks, spansize, totalsize, lost])
+    return raidsetups
+
+
+def checkSpanRaid(raidtype, numberofdisks):
+
+    modulostart = numberofdisks / 2 + 1
+    raidsetups = []
+    # Ok simmilar to above, if we can't get an divide without a reminder we can't facilitate the spaned raid level with the given number of disks, its simples a a meerkat can get ;) - we just return a string saying not_possible.
+    for x in range(modulostart, raidtype - 3, -1):
+        if not numberofdisks % x:
+            raidsetups.append([numberofdisks / x, x])
+    if len(raidsetups) == 0:
+        raidsetups.append("not_possible")
+    return raidsetups
+
+
+def getPossibleRaidLevels(numberofdisks):
+    # Raid 60 min 8 disk and the same amout of drives in each span min two spans, and min 4 drives per span
+    # Raid 50 min 6 disk and the same amout of drives in each span min two spans, and min 3 drives per span
+    # Raid 10 min 4 disk and div by 2
+    # Raid 6 min 4 disk
+    # Raid 5 min 3 disk
+    # Raid 1 min 2 disk and div by 2
+    # Raid 0 min 1 disk
+
+    if numberofdisks >= 1:
+        possibleraid = [0]
+    if numberofdisks >= 2 and numberofdisks % 2 == 0:
+        possibleraid.append(1)
+    if numberofdisks >= 3:
+        possibleraid.append(5)
+    if numberofdisks >= 4:
+        possibleraid.append(6)
+    if numberofdisks >= 4 and numberofdisks % 2 == 0:
+        possibleraid.append(10)
+    # The more problimatic raid levels 5 and 6, it's not as simple as
+    # modulo 3 and 4 since it all depens on # of drives in each span
+    # and how many spans
+    if numberofdisks >= 6 and checkSpanRaid(5, numberofdisks)[0] != 'not_possible':
+        possibleraid.append(50)
+    if numberofdisks >= 8 and checkSpanRaid(6, numberofdisks)[0] != 'not_possible':
+        possibleraid.append(60)
+    return possibleraid
+
+
+def getRaidChoice(possibleraid, physical_disks, phsize):
+    rchoice = ''
+    physical_disks_copy = list(physical_disks)
+    lastdisk = physical_disks_copy.pop()
+
+    drvfmt = "%-10s | %-20s | %-10s "
+
+    while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+
+        print "Selected disk(s):"
+        if len(physical_disks_copy) == 0:
+            print lastdisk
+        else:
+            print ', '.join(str(x) for x in physical_disks_copy) + " and " + str(lastdisk)
+        print
+        print "Please select raid type:"
+        print
+        string = drvfmt % ("-- Raid", "Size", "Loss")
+        print getFormat("<b>%s</n>" % string)
+        for raids in possibleraid:
+            if raids == 0:
+                size = len(physical_disks) * phsize
+                loss = 0
+                print drvfmt % (raids, size, loss)
+            elif raids == 1:
+                size = len(physical_disks) / 2 * phsize
+                loss = size
+                if len(physical_disks) > 2:
+                    print drvfmt % ("%s (1e)" % raids, size, loss)
+                else:
+                    print drvfmt % (raids, size, loss)
+            elif raids == 5:
+                size = (len(physical_disks) - 1) * phsize
+                loss = phsize
+                print drvfmt % (raids, size, loss)
+            elif raids == 6:
+                size = (len(physical_disks) - 2) * phsize
+                loss = phsize * 2
+                print drvfmt % (raids, size, loss)
+            elif raids == 10:
+                size = len(physical_disks) / 2 * phsize
+                loss = size
+                print drvfmt % (raids, size, loss)
+            elif raids == 50:
+                raidtable = checkSpanRaidSizes(5, len(physical_disks), phsize)
+                minsize = raidtable[len(raidtable) - 1][3]
+                maxsize = raidtable[0][3]
+                minloss = raidtable[0][4]
+                maxloss = raidtable[len(raidtable) - 1][4]
+                if minsize == maxsize:
+                    print drvfmt % (raids, minsize, minloss)
+                else:
+                    print drvfmt % (raids, "%s-%s" % (minsize, maxsize), "%s-%s" % (minloss, maxloss))
+            elif raids == 60:
+                raidtable = checkSpanRaidSizes(6, len(physical_disks), phsize)
+                minsize = raidtable[len(raidtable) - 1][3]
+                maxsize = raidtable[0][3]
+                minloss = raidtable[0][4]
+                maxloss = raidtable[len(raidtable) - 1][4]
+                if minsize == maxsize:
+                    print drvfmt % (raids, minsize, minloss)
+                else:
+                    print drvfmt % (raids, "%s-%s" % (minsize, maxsize), "%s-%s" % (minloss, maxloss))
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+
+            try:
+                raidchoice = int(rchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            try:
+                possibleraid.index(raidchoice)
+                return raidchoice
+            except ValueError:  # Exception as ex:
+                # template = "An exception of type {0} occured. Arguments:\n{1!r}"
+                # message = template.format(type(ex).__name__, ex.args)
+                # print message
+                print "Raid %d it not a valid selection" % raidchoice
+                print
+    return -1
+
+
+def createEncslotid(controllerid, raiddisks):
+    encslotid = []
+    for raiddisk in raiddisks:
+        for phdisk in diskdb:
+            if controllerid == phdisk.cid and raiddisk == phdisk.lsidid:
+                encslotid.append("[%s:%s]", (phdisk.enclid, phdisk.slotid))
+    return encslotid
+
+
+def createEncslotidv2(controllerid, raiddisks):
+    encslotid = []
+    for raiddisk in raiddisks:
+        for phdisk in diskdb:
+            if controllerid == phdisk.cid and raiddisk == phdisk.lsidid:
+                encslotid.append("%s:%s" % (phdisk.enclid, phdisk.slotid))
+    return encslotid
+
+
+def createSimpleRaid(controllerid, physical_disks, raidchoice, settings):
+    encslotid = createEncslotidv2(controllerid, physical_disks)
+    encslotidstring = str("\"[%s]\"") % ",".join(encslotid)
+    cmd = '%s  -CfgLdAdd -r%d %s %s -a%d ' % (megaclipath, raidchoice, encslotidstring, settings, controllerid)
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Array created sucessfully"
+        LOG.info(output)
+    time.sleep(5)
+    scan()
+
+
+def createSpanningRaid(controllerid, physical_disks, raidchoice, size, settings):
+    if raidchoice == 10:
+        number_of_disks = len(physical_disks)
+        x = 0
+        i = 0
+        array_string = ''
+        spanfmt = str('%7s | %-5s')
+        print
+        print "Creating Raid 10, with %d striped spans, each span is 2 raided disks as follows" % (number_of_disks / 2)
+        print
+
+        while x < number_of_disks:
+            if (i == 0):
+                string = spanfmt % ("-- Span", "Disks")
+                print getFormat("<b>%s</n>" % string)
+            print spanfmt % (str(i), "%s,%s" % (physical_disks[x], physical_disks[x + 1]))
+            x += 2
+            i += 1
+
+        x = 0
+        i = 0
+        array_string = ''
+
+        while x < number_of_disks:
+            encslotid = createEncslotidv2(controllerid, [physical_disks[x], physical_disks[x + 1]])
+            encslotidstring = ' -Array%d"[%s]"' % (i, ",".join(encslotid))
+            array_string += encslotidstring
+            x += 2
+            i += 1
+        cmd = '%s  -CfgSpanAdd -r%d %s %s -a%d ' % (megaclipath, raidchoice, array_string, settings, controllerid)
+        LOG.info(cmd)
+        output = getOutput(cmd)
+        if is_error(output):
+            print getFormat("<b>An error occoured, please investigate</n>")
+            print output
+            print
+            LOG.error(output)
+        else:
+            print "Array created sucessfully"
+            LOG.info(output)
+            print
+        time.sleep(5)
+        scan()
+        return
+
+    if raidchoice == 50 or raidchoice == 60:
+        if raidchoice == 50:
+            raidsetups = checkSpanRaidSizes(5, len(physical_disks), size)
+        else:
+            raidsetups = checkSpanRaidSizes(6, len(physical_disks), size)
+
+        rchoice = ''
+        while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+
+            i = 0
+            print
+            print "Select Raid %d setup listed below:" % raidchoice
+            print
+            spanfmt = str('%5s | %-7s | %-7s | %-9s | %-10s | %-5s')
+            string = spanfmt % ("-- ID", "# Spans", "# Disk", "Span Size", "Total Size", "Loss")
+            print getFormat("<b>%s</n>" % string)
+            for raidsetup in raidsetups:
+                print spanfmt % (str(i),
+                                 raidsetup[0],
+                                 raidsetup[1],
+                                 raidsetup[2],
+                                 raidsetup[3],
+                                 raidsetup[4])
+                i += 1
+            print
+            print getFormat("<b>Q</n>uit) Quit")
+            print
+            rchoice = raw_input(prompt)
+            print
+            if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+                try:
+                    selectraid = int(rchoice.strip())
+                except ValueError:
+                    print "Invalid value"
+                    print
+                    continue
+                if selectraid > (len(raidsetups) - 1):
+                    print "%d it not a valid selection" % selectraid
+                    print
+                    continue
+                x = 0
+                array_string = ''
+                spanfmt = str('%8s | %-50s')
+                number_of_spans = raidsetups[selectraid][0]
+                number_of_disks_per_span = raidsetups[selectraid][1]
+                print
+                print "Creating Raid %d, with %d striped spans, each span is %d disks in a raid %d setup" % (raidchoice, number_of_spans, number_of_disks_per_span, raidchoice / 10)
+                print
+                while x < number_of_spans:
+                    if (x == 0):
+                        string = spanfmt % ("-- Span", "Disks")
+                        print getFormat("<b>%s</n>" % string)
+                    y = 0
+                    while y < number_of_disks_per_span:
+                        if y == 0:
+                            spanstring = str(physical_disks[(x * number_of_disks_per_span)])
+                        else:
+                            spanstring += str(',' + str(physical_disks[(x * number_of_disks_per_span) + y]))
+                        y += 1
+                    print spanfmt % (str(x), spanstring)
+                    x += 1
+
+                x = 0
+                array_string = ''
+                while x < number_of_spans:
+                    y = 0
+                    while y < number_of_disks_per_span:
+                        encslotid = createEncslotidv2(controllerid, [physical_disks[(x * number_of_disks_per_span) + y]])
+                        if y == 0:
+                            spanstring = str("".join(encslotid))
+                        else:
+                            spanstring += str(',' + str(encslotid[0]))
+                        y += 1
+                    array_string += str('-Array' + str(x) + '"[' + spanstring + ']" ')
+                    x += 1
+
+                cmd = '%s  -CfgSpanAdd -r%d %s %s -a%d ' % (megaclipath, raidchoice, array_string, settings, controllerid)
+                LOG.info(cmd)
+                output = getOutput(cmd)
+                if is_error(output):
+                    print
+                    print getFormat("<b>An error occoured, please investigate</n>")
+                    print output
+                    print
+                    LOG.error(output)
+                else:
+                    print
+                    print "Array created sucessfully"
+                    print
+                    LOG.info(output)
+                time.sleep(5)
+                scan()
+                return
+
+
+def wantToSetArrayOptions(controllerid):
+    rchoice = ''
+
+    while True:
+        print
+        print "Create array with controler default values Yes/No:"
+        print
+        print getFormat("<b>Yes</n> Will create an array according to controller defaults")
+        print getFormat("<b>No</n>  Will let you configure array settings, for the array to be created")
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        if re.match('Y|Yes', rchoice, re.IGNORECASE):
+            return []
+        elif re.match('N|No', rchoice, re.IGNORECASE):
+            creation_off_array = True
+            return setArrayOptions(controllerid, -1, creation_off_array)
+        elif re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+            return [-1]
+
+
+def createArrayOnCnt(controllerid):
+    rchoice = ''
+
+    while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+        print "Select disks to create array from as comma separated list of Disk ID"
+        print "All will select all disks"
+        print
+        printAvailableDiskByController(controllerid, True)
+        free_disks = getDisksByController(controllerid)
+        print
+        print getFormat("<b>A</n>ll) All disks above")
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        cont = False
+        size = 0
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+            i = 0
+            if re.match('a|all', '%s' % rchoice, re.IGNORECASE):
+                rchoice = ','.join(str(x) for x in free_disks)
+            physical_disks = rchoice.split(',')
+            for physical_disk in physical_disks:
+                try:
+                    physical_disks[i] = int(physical_disk.strip())
+                except ValueError:
+                    print "Only Quit or valid Disk ID"
+                    print
+                    cont = True
+                    break
+                if not freeInDiskdb(controllerid, physical_disks[i]):
+                    print "Invalid Disk ID %d" % physical_disks[i]
+                    cont = True
+                    break
+                # Should we really do a size check?
+                presize = size
+                size = getDiskSize(controllerid, physical_disks[i])
+                if size == -1:
+                    print
+                    print getFormat("<b>Fatal error, can't find size of disk id %d</n>" % physical_disks[i])
+                    cont = True
+                    break
+                if presize == 0:
+                    presize = size
+                if presize != size:
+                    print getFormat("<b>Fatal error, disk %d and disk %d, size difference %d and %d</n>" % (physical_disks[i - 1], physical_disks[i], presize, size))
+                    cont = True
+                    break
+                i += 1
+
+            # else in for or while loops is the same as "if no break"  Which is very backward you would normaly want "if break": do XYZ, that one would be useful after all.
+            # Not saying it aint useful we do make use of it but it woudl been a whole lot more useful if we had else to mean if break.
+
+            if cont:
+                continue
+
+            numberofdisk = len(physical_disks)
+            posraid = getPossibleRaidLevels(numberofdisk)
+            raidchoice = getRaidChoice(posraid, physical_disks, size)
+            if raidchoice == -1:
+                continue
+
+            options = wantToSetArrayOptions(controllerid)
+            if len(options) == 1 and options[0] == -1:
+                continue
+            if len(options) > 0:
+                settings = ' '.join(str(x) for x in options)
+            else:
+                settings = ' '
+
+            if raidchoice == 0 or raidchoice == 1 or raidchoice == 5 or raidchoice == 6:
+                createSimpleRaid(controllerid, physical_disks, raidchoice, settings)
+            elif raidchoice == 10 or raidchoice == 50 or raidchoice == 60:
+                createSpanningRaid(controllerid, physical_disks, raidchoice, size, settings)
+            if not freeDiskonCtrl(controllerid):
+                return
+
+
+def selectControllerToCreateOn(what_to_create):
+    cchoice = ''
+    controllerid = 0
+
+    while not re.match('q|quit', '%s' % cchoice, re.IGNORECASE):
+        controllerid = 0
+        while controllerid < controllernumber:
+            if controllerdb[controllerid].avalible_disk != 0:
+                break
+            controllerid += 1
+        else:  # Wow we could use the worthless else after all ;)
+            print
+            print "No disks available to create %s from" % what_to_create
+            print
+            return
+
+        print "Select controller to create %s on" % what_to_create
+        print
+        controllerid = 0
+        i = 0
+        while controllerid < controllernumber:
+            controller = controllerdb[controllerid]
+            if controller.avalible_disk != 0:
+                hbafmt = str('%5s | %-2s | %-20s | %-15s ')
+                if (i == 0):
+                    string = hbafmt % ("-- No", "ID", "H/W Model", "# Avail Disk")
+                    print getFormat("<b>%s</n>" % string)
+                print hbafmt % (
+                    controller.cid,
+                    controller.controller_string,
+                    controller.controller_type,
+                    controller.avalible_disk)
+                i += 1
+            controllerid += 1
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        cchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % cchoice, re.IGNORECASE) and not re.match('^$', '%s' % cchoice, re.IGNORECASE):
+            try:
+                cid = int(cchoice)
+            except ValueError:
+                print "Invalid value"
+                print
+                return -2
+            if cid >= 0 and cid < controllernumber:
+                return cid
+            else:
+                print "Invalid controller # %d" % cid
+                print
+
+    return -1
+
+
+def selectController(message, controllers):
+    cchoice = ''
+    controllerid = 0
+
+    while not re.match('q|quit', '%s' % cchoice, re.IGNORECASE):
+        print "Select controller %s" % message
+        print
+        controllerid = 0
+        i = 0
+
+        while controllerid < controllernumber:
+            controller = controllerdb[controllerid]
+
+            try:
+                controllers.index(controllerid)
+            except ValueError:
+                controllerid += 1
+                continue
+
+            if controller.avalible_disk != 0:
+                hbafmt = str('%5s | %-2s | %-20s | %-15s ')
+                if (i == 0):
+                    string = hbafmt % ("-- No", "ID", "H/W Model", "# Avail Disk")
+                    print getFormat("<b>%s</n>" % string)
+                print hbafmt % (
+                    controller.cid,
+                    controller.controller_string,
+                    controller.controller_type,
+                    controller.avalible_disk)
+                i += 1
+            controllerid += 1
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        cchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % cchoice, re.IGNORECASE) and not re.match('^$', '%s' % cchoice, re.IGNORECASE):
+            try:
+                cid = int(cchoice)
+            except ValueError:
+                print "Invalid value"
+                print
+                return
+            if cid >= 0 and cid < controllernumber:
+                return cid
+            else:
+                print "Invalid controller # %d" % cid
+                print
+
+    return -1
+
+
+def selectArray(message, cid):
+    rchoice = ''
+
+    while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+        print "Select array %s" % message
+        print
+        with_disks = False
+        printArraysByController(cid, with_disks)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+            for array in arraydb:
+                if array.controller_array_id == rchoice and cid == array.cid:
+                    arrayid = array.arrayid
+                    break
+
+            else:
+                print "Invalid array ID %s" % rchoice
+                print
+                continue
+
+            break   # You will only reach this line if you had a break in the for loop
+
+    else:
+        return -1
+    return arrayid
+
+
+def selectArrayList(message, cid, array_list):
+    rchoice = ''
+
+    while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+        print "Select array %s" % message
+        with_disks = False
+        print
+        printArrayListsByController(cid, array_list, with_disks)
+        print
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+            for array in arraydb:
+                if array.controller_array_id == rchoice and cid == array.cid:
+                    arrayid = array.arrayid
+                    break
+            else:
+                print "Invalid array ID %s" % rchoice
+                continue
+
+            break
+
+    else:
+        return -1
+    return arrayid
+
+
+def selectDiskInArray(message, cid, arrayid):
+    hchoice = ''
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+        print "Select disk %s" % message
+        print
+        printUsedDisksByControllerArrayWithIdFirst(cid, arrayid)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+            try:
+                diskchoice = int(hchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            for phdisk in diskdb:
+                if phdisk.cid == cid and phdisk.arrayid == arrayid and phdisk.lsidid == diskchoice:
+                    return phdisk
+            print "Invalid Disk ID %s" % hchoice
+            print
+    return [-1]
+
+
+def createArray():
+    spin = 0
+    while spin == 0:
+        cid = selectControllerToCreateOn("array")
+        if cid == -1:
+            return
+        if cid >= 0:
+            break
+
+    createArrayOnCnt(cid)
+
+
+def configArrayOptions():
+    rchoice = ''
+
+    while True:
+        print "Select array to configure"
+        print
+        with_disks = False
+        printArrays(with_disks)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+            for array in arraydb:
+                if array.controller_array_id == rchoice:
+                    controllerid = array.cid
+                    arrayid = array.arrayid
+                    break
+            else:
+                print "Invalid array ID %s" % rchoice
+                print
+                continue
+
+        if re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+            return
+        creation_off_array = False
+        options = setArrayOptions(controllerid, arrayid, creation_off_array)
+        if len(options) == 1 and options[0] == -1:
+            continue
+        if len(options) == 0:
+            print
+            print "No settings changed"
+            return
+
+        print "Setting array %s config values" % rchoice
+        for option in options:
+            cmd = '%s  -LDSetProp %s -L%d -a%d ' % (megaclipath, option, arrayid, controllerid)
+            LOG.info(cmd)
+            output = getOutput(cmd)
+            if is_error(output):
+                print getFormat("<b>An error occoured, please investigate</n>")
+                print output
+                print
+                LOG.error(output)
+                break
+            else:
+                print "Array %s config value sucessfully applied" % option
+                print
+                LOG.info(output)
+            time.sleep(1)
+
+        scan()
+        return
+
+
+def deleteArray():
+    rchoice = ''
+
+    while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
+        print "Select array to delete"
+        print
+        with_disks = False
+        printArrays(with_disks)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        rchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+            for array in arraydb:
+                if array.controller_array_id == rchoice:
+                    controllerid = array.cid
+                    arrayid = array.arrayid
+                    break
+            else:
+                print "Invalid array ID %s" % rchoice
+                continue
+            break
+    else:
+        return
+
+    print "Deleting %s" % rchoice
+    cmd = '%s  -CfgLdDel  -L%d -a%d ' % (megaclipath, arrayid, controllerid)
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Array deleted sucessfully"
+        LOG.info(output)
+
+    time.sleep(5)
+    scan()
+
+
+def printHotSpares(diskid_first):
+    if diskid_first:
+        drvfmt = "%-10s | %-8s | %-4s | %-7s | %-15s | %-8s | %-8s | %-7s"
+    else:
+        drvfmt = "%-8s | %-4s | %-7s | %-15s | %-8s | %-8s | %-7s | %-8s"
+    i = 0
+    for phdisk in diskdb:
+        if phdisk.hotspare == 1:
+
+            # Header
+            if (i == 0):
+                if diskid_first:
+                    string = drvfmt % ("-- Disk ID", "ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "HotSpare Type")
+                    print getFormat("<b>%s</n>" % string)
+                else:
+                    string = drvfmt % ("-- ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Disk ID", "HotSpare Type")
+                    print getFormat("<b>%s</n>" % string)
+            # Drive information
+            if diskid_first:
+                if phdisk.arrayid == -2:
+                    diskstring = "c%daXsYaZ" % (phdisk.cid)
+                else:
+                    diskstring = "c%da%dsXaY" % (phdisk.cid, phdisk.arrayid)
+                print drvfmt % (
+                    phdisk.lsidid,
+                    diskstring,
+                    phdisk.mtype,
+                    phdisk.dsize,
+                    phdisk.fstate,
+                    phdisk.speed,
+                    "[%s:%s]" % (phdisk.enclid, phdisk.slotid),
+                    phdisk.hotspare_type)
+            else:
+                if phdisk.arrayid == -2:
+                    diskstring = "c%daXsYaZ" % (phdisk.cid)
+                else:
+                    diskstring = "c%da%dsXaY" % (phdisk.cid, phdisk.arrayid)
+                print drvfmt % (
+                    diskstring,
+                    phdisk.mtype,
+                    phdisk.dsize,
+                    phdisk.fstate,
+                    phdisk.speed,
+                    "[%s:%s]" % (phdisk.enclid, phdisk.slotid),
+                    phdisk.lsidid,
+                    phdisk.hotspare_type)
+
+            i = i + 1
+
+
+def deleteHotSpare():
+    hchoice = ''
+
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+
+        print "Select HotSpare to delete"
+        print
+        diskid_first = True
+        printHotSpares(diskid_first)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+            try:
+                hotsparechoice = int(hchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            for phdisk in diskdb:
+                if phdisk.hotspare == 1 and phdisk.lsidid == hotsparechoice:
+                    physdrv = "[%s:%s]" % (phdisk.enclid, phdisk.slotid)
+                    cmd = '%s  -PDHSP -Rmv -PhysDrv"%s" -a%d ' % (megaclipath, physdrv, phdisk.cid)
+                    break
+            else:
+                print "Invalid HotSpare ID %s" % hchoice
+                print
+                continue
+            break
+    else:
+        return
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "HotSpare deleted sucessfully"
+        LOG.info(output)
+
+    time.sleep(5)
+    scan()
+
+
+def createHotSpare():
+
+    spin = 0
+    while spin == 0:
+        cid = selectControllerToCreateOn("hotspare")
+        if cid == -1:
+            return
+        if cid >= 0:
+            break
+
+    hchoice = ''
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+
+        print "Select what Hotdisk type:"
+        print
+        print getFormat("<b>Gl</n>) Global")
+        print getFormat("<b>De</n>) Dedicated")
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        print
+
+        if re.match('De', hchoice, re.IGNORECASE):
+            dedicated = True
+            break
+        if re.match('Gl', hchoice, re.IGNORECASE):
+            dedicated = False
+            break
+
+    else:
+        return
+
+    if dedicated:
+        hchoice = ''
+        while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+            print "Select array for your dedicated hotspare"
+            print
+            with_disks = False
+            printArraysByController(cid, with_disks)
+            print
+            print getFormat("<b>Q</n>uit) Quit")
+            print
+            hchoice = raw_input(prompt)
+            print
+            if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+                for array in arraydb:
+                    if array.controller_array_id == hchoice and array.cid == cid:
+                        arrayid = array.arrayid
+                        break
+                else:
+                    print "Invalid array ID %s" % hchoice
+                    print
+                    continue
+
+                break
+        else:
+            return
+
+    hchoice = ''
+    while True:
+        print "Select disks (Disk ID) to create hotspare from"
+        print
+        printAvailableDiskByController(cid, True)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+            try:
+                hotsparechoice = int(hchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            if not freeInDiskdb(cid, hotsparechoice):
+                print "Invalid Disk ID %d" % hotsparechoice
+                print
+                continue
+            else:
+                break
+        elif re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+            return
+
+    physdrv = createEncslotidv2(cid, [hotsparechoice])
+    physdrv = str("\"[%s]\"") % ",".join(physdrv)
+
+    if dedicated:
+        cmd = '%s  -PDHSP -Set -Dedicated -Array%d -PhysDrv%s -a%d' % (megaclipath, arrayid, physdrv, cid)
+    else:
+        cmd = '%s  -PDHSP -Set -PhysDrv%s -a%d' % (megaclipath, physdrv, cid)
+
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Hotspare created sucessfully"
+        print
+        LOG.info(output)
+
+    time.sleep(5)
+    scan()
+
+
+def manageHotSpares():
+    hchoice = ''
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+
+        nodisk = True
+        number_of_hotspares = 0
+
+        for phdisk in diskdb:
+            if phdisk.hotspare == 1:
+                number_of_hotspares += 1
+
+        controllerid = 0
+        while controllerid < controllernumber:
+            if controllerdb[controllerid].avalible_disk != 0:
+                nodisk = False
+            controllerid += 1
+
+        if number_of_hotspares >= 1:
+            print getFormat(" <b>Pr</n>) Print HotSpares")
+        if not nodisk:
+            print getFormat(" <b>Cr</n>) Create HotSpares")
+        if number_of_hotspares >= 1:
+            print getFormat(" <b>De</n>) Delete HotSpares")
+        print ""
+        print getFormat(" <b>Q</n>uit) Quit")
+        print ""
+        hchoice = raw_input(prompt)
+        print
+
+        if re.match('Pr', hchoice, re.IGNORECASE):
+            diskid_first = False
+            printHotSpares(diskid_first)
+            print
+        if re.match('Cr', hchoice, re.IGNORECASE):
+            createHotSpare()
+        if re.match('De', hchoice, re.IGNORECASE):
+            deleteHotSpare()
+
+
+def scanForeignDisks():
+    global foreigndiskdb
+    foreigndiskdb = []
+    scan()
+    controllerid = 0
+    while controllerid < controllernumber:
+        if controllerdb[controllerid][12] != 0:
+            cmd = '%s -CfgForeign -Preview -a%d -NoLog' % (megaclipath, controllerid)
+            output = getOutput(cmd)
+            foreigndiskdb.append(foreignTable(output, controllerid))
+        controllerid += 1
+
+
+def printForeignDisks():
+    for controller in foreigndiskdb:
+        try:
+            print getFormat("<b>-- <u>Foreign Disk Arrays on Controller c%d</u> --</n>" % controller[0].cid)
+        except IndexError:
+            print controller
+        for diskgroup in controller:
+            dgfmt = str('%-5s | %-7s | %7s | %7s ')
+            string = dgfmt % ("-- ID", "Type", "Size", "Status")
+            print getFormat("<b>%s</n>" % string)
+            if diskgroup.state != "Optimal":
+                state = getFormat("<b><r><bl><bg_green><red>%s</n>" % diskgroup.state)
+            else:
+                state = diskgroup.state
+            print dgfmt % (
+                "c%sa%s" % (controller[0].cid, diskgroup.disk_group),
+                diskgroup.raidtype,
+                diskgroup.size,
+                state)
+            i = 0
+            for fdisk in diskgroup.FDiskTable:
+                if i == 0:
+                    drvfmt = "%-5s | %-4s | %-7s | %-20s | %-8s | %-8s"
+                    string = drvfmt % ("-- ID", "Type", "Size Gb", "Status", "Slot ID", "Disk ID")
+                    print getFormat("<b>%s</n>" % string)
+                print drvfmt % (
+                    "c%sa%sd%s" % (controller[0].cid, diskgroup.disk_group, fdisk.disk_number),
+                    fdisk.mtype,
+                    fdisk.dsize,
+                    fdisk.fstate,
+                    "[%s:%s]" % (fdisk.enclid, fdisk.slotid),
+                    fdisk.lsidid)
+                i += 1
+            print
+        print
+
+
+def clearForeignDisks():
+    which_controllers = []
+    for c in foreigndiskdb:
+        which_controllers.extend(c[0])
+
+    cid = selectController("to clear foreign disks on", which_controllers)
+    if cid == -1:
+        return
+    cmd = '%s -CfgForeign -Clear -a%d' % (megaclipath, cid)
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Foreign Disks cleared sucessfully"
+        LOG.info(output)
+    time.sleep(5)
+    scan()
+    scanForeignDisks()
+
+
+def importForeignDisks():
+    which_controllers = []
+    for c in foreigndiskdb:
+        which_controllers.extend(c[0])
+    cid = selectController("to import foreign disks on", which_controllers)
+    if cid == -1:
+        return
+    cmd = '%s -CfgForeign -Import -a%d' % (megaclipath, cid)
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        print
+        LOG.error(output)
+    else:
+        print "Foreign Disks imported sucessfully"
+        print
+        LOG.info(output)
+    time.sleep(5)
+    scan()
+    scanForeignDisks()
+
+
+def manageForeignDrives():
+    scanForeignDisks()
+    hchoice = ''
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+
+        foreign_disks = False
+        controllerid = 0
+        while controllerid < controllernumber:
+            if controllerdb[controllerid].foreign_disk != 0:
+                foreign_disks = True
+            controllerid += 1
+
+        if foreign_disks:
+            print getFormat(" <b>Pr</n>) Print Foreign Disk(s)")
+            print getFormat(" <b>Cl</n>) Clear Foreign Disk(s)")
+            print getFormat(" <b>Im</n>) Import Foreign Disk(s)")
+            print getFormat(" <b>Sc</n>) Scan Foreign Disk(s)")
+            print
+            print getFormat(" <b>Q</n>uit) Quit")
+            print
+            hchoice = raw_input(prompt)
+            print
+
+            if re.match('Pr', hchoice, re.IGNORECASE):
+                printForeignDisks()
+            if re.match('Cl', hchoice, re.IGNORECASE):
+                clearForeignDisks()
+            if re.match('Im', hchoice, re.IGNORECASE):
+                importForeignDisks()
+            if re.match('Sc', hchoice, re.IGNORECASE):
+                scanForeignDisks()
+        else:
+            return
+
+
+def printDisksListWithIdFirst(disk_list):
+    drvfmt = "%-8s | %-8s | %-4s | %-8s | %-15s | %-8s | %-8s "
+    i = 0
+    for phdisk in disk_list:
+        # Header
+        if (i == 0):
+            string = drvfmt % ("Disk ID", "-- ID", "Type", "Size Gb", "Status", "Speed", "Slot ID")
+            print getFormat("<b>%s</n>" % string)
+        # Drive information
+        diskstring = "c%sa%ss%sa%s" % (phdisk.cid, phdisk.arrayid, phdisk.spanid, phdisk.armid)
+        print drvfmt % (
+            phdisk.lsidid,
+            diskstring,
+            phdisk.mtype,
+            phdisk.dsize,
+            phdisk.fstate,
+            phdisk.speed,
+            "[%s:%s]" % (phdisk.enclid, phdisk.slotid))
+        i = i + 1
+
+
+def scanMissing():
+    is_missing = False
+    missingtable = []
+    controllerid = 0
+    while controllerid < controllernumber:
+        cmd = '%s -PDGetMissing -a%d -NoLog' % (megaclipath, controllerid)
+        output = getOutput(cmd)
+        try:
+            missingtable.extend(missingTable(output, controllerid))
+            is_missing = True
+        except TypeError:
+            pass
+        controllerid += 1
+    if is_missing:
+        return missingtable
+    return
+
+
+def offLineDisk():
+    controller_array_list = []
+    i = 0
+    for array in arraydb:
+        if i == 0:
+            arrayid = array.cid
+            controller_array_list.extend([arrayid])
+            i += 1
+            continue
+        if controller_array_list[-1] != array.cid:
+            arrayid = array.cid
+            controller_array_list.extend([arrayid])
+    cid = selectController(" to off line disks on", controller_array_list)
+    if cid == -1:
+        return
+    arrayid = selectArray("to off line disks on", cid)
+    if arrayid == -1:
+        return
+    disklist = selectDiskInArray("to off line", cid, arrayid)
+    if disklist[0] == -1:
+        return
+    disk = str('\"[' + str(disklist[10]) + ':' + str(disklist[11]) + ']\"')
+    cmd = '%s -PDOffline -PhysDrv%s -a%d' % (megaclipath, disk, cid)
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Disk offlined sucessfully"
+        LOG.info(output)
+    time.sleep(5)
+    scan()
+
+
+def markMissing():
+    hchoice = ''
+    offline_table = []
+    for phdisk in diskdb:
+        try:
+            phdisk.index('Offline')
+            offline_table.append(phdisk)
+        except ValueError:
+            pass
+
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+        print "Select Disk to Mark Missing"
+        print
+        printDisksListWithIdFirst(offline_table)
+        print
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+            try:
+                disk_choice = int(hchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            for phdisk in offline_table:
+                if phdisk.lsidid == disk_choice:
+                    physdrv = str('[' + str(phdisk.enclid) + ':' + str(phdisk.slotid) + ']')
+                    cmd = '%s  -PDMarkMissing  -PhysDrv"%s" -a%d ' % (megaclipath, physdrv, phdisk.cid)
+                    break
+            else:
+                print "Invalid Disk ID %s" % hchoice
+                print
+                continue
+            break
+    else:
+        return
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Disk marked missing sucessfully"
+        LOG.info(output)
+    time.sleep(5)
+    scan()
+
+
+def replaceMissing():
+    missingtable = []
+    try:
+        missingtable.extend(scanMissing())
+    except TypeError:
+        pass
+    i = 0
+    controller_array_list = []
+    for missing_array in missingtable:
+        if i == 0:
+            arrayid = missing_array[0]
+            controller_array_list.extend([arrayid])
+            i += 1
+            continue
+        if controller_array_list[-1] != missing_array[0]:
+            arrayid = missing_array[0]
+            controller_array_list.extend([arrayid])
+    cid = selectController(" to replace missing disk on", controller_array_list)
+    if cid == -1:
+        return
+
+    array_list = []
+    for missing_array in missingtable:
+        if missing_array[0] == cid:
+            arrayid = missing_array[1]
+            array_list.extend([arrayid])
+
+    arrayid = selectArrayList("to replace missing disk on", cid, array_list)
+    if arrayid == -1:
+        return
+
+    hchoice = ''
+    while True:
+        print "Select disks (Disk ID) to replace missing disk with"
+        print
+        id_first = True
+        printAvailableDiskByController(cid, id_first)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        print
+        if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+            try:
+                missing_choice = int(hchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            if not freeInDiskdb(cid, missing_choice):
+                print "Invalid Disk ID %d" % missing_choice
+                print
+                continue
+            else:
+                break
+        elif re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+            return
+
+    physdrv = createEncslotidv2(cid, [missing_choice])
+    physdrv = '"[%s]"' % ",".join(physdrv)
+
+    for missing in missingtable:
+        if missing[0] == cid and missing[1] == arrayid:
+            row = missing[2]
+
+    cmd = '%s -PdReplaceMissing -PhysDrv%s  -Array%d -row%s -a%d' % (megaclipath, physdrv, arrayid, row, cid)
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Disk replaced sucessfully"
+        print
+        LOG.info(output)
+
+
+def rebuildDisk():
+    hchoice = ''
+    offline_table = []
+    for phdisk in diskdb:
+        try:
+            phdisk.index('Offline')
+            offline_table.append(phdisk)
+        except ValueError:
+            pass
+
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+
+        print "Select Disk to Rebuild"
+        print
+        printDisksListWithIdFirst(offline_table)
+        print
+        print getFormat("<b>Q</n>uit) Quit")
+        print
+        hchoice = raw_input(prompt)
+        if not re.match('q|quit', '%s' % hchoice, re.IGNORECASE) and not re.match('^$', '%s' % hchoice, re.IGNORECASE):
+            try:
+                disk_choice = int(hchoice.strip())
+            except ValueError:
+                print "Invalid value"
+                print
+                continue
+            for phdisk in offline_table:
+                if phdisk.lsidid == disk_choice:
+                    physdrv = str('[' + str(phdisk.enclid) + ':' + str(phdisk.slotid) + ']')
+                    cmd = '%s  -PDRbld -Start  -PhysDrv"%s" -a%d ' % (megaclipath, physdrv, phdisk.cid)
+                    break
+            else:
+                print "Invalid Disk ID %s" % hchoice
+                print
+                continue
+            break
+    else:
+        return
+    LOG.info(cmd)
+    output = getOutput(cmd)
+    if is_error(output):
+        print getFormat("<b>An error occoured, please investigate</n>")
+        print output
+        LOG.error(output)
+    else:
+        print "Rebuild started sucessfully of disk %s" % hchoice
+        print
+        LOG.info(output)
+    time.sleep(5)
+    scan()
+
+
+def manageDisksCheck():
+
+    is_offline = False
+    for phdisk in diskdb:
+        try:
+            phdisk.index('Offline')
+            is_offline = True
+        except ValueError:
+            pass
+
+    is_missing = False
+    missingtable = []
+    try:
+        missingtable.extend(scanMissing())
+        is_missing = True
+    except TypeError:
+        pass
+
+    free_disks = False
+    controllerid = 0
+    while controllerid < controllernumber:
+        if controllerdb[controllerid].avalible_disk != 0:
+            free_disks = True
+        controllerid += 1
+
+    used_disks = False
+    controllerid = 0
+    while controllerid < controllernumber:
+        if controllerdb[controllerid].used_disk != 0:
+            used_disks = True
+        controllerid += 1
+
+    return (is_offline, is_missing, free_disks, used_disks)
+
+
+def manageDisks():
+    hchoice = ''
+    while not re.match('q|quit', '%s' % hchoice, re.IGNORECASE):
+
+        is_offline, is_missing, free_disks, used_disks = manageDisksCheck()
+        # if used_disks:
+        #     print " Rd) Remove Disk"
+        # if is_missing:
+        #     print " Re) Replace and Rebuild Missing Disk(s)"
+        # print " Ma) Mark Disk as Good"
+        if used_disks:
+            print getFormat(" <b>Of</n>) Offline Disk")
+        if is_offline:
+            print getFormat(" <b>Mi</n>) Mark Disk as Missing")
+        if free_disks:
+            # print " Pr) Prep Disk for Removal"
+            print getFormat(" <b>Rm</n>) Replace Missing Disk")
+        if is_missing:
+            print getFormat(" <b>Rb</n>) Rebuild Disk")
+        print ""
+        print getFormat(" <b>Q</n>uit) Quit")
+        print ""
+        hchoice = raw_input(prompt)
+        print
+        if re.match('Rd', hchoice, re.IGNORECASE):
+            pass
+        if re.match('Re', hchoice, re.IGNORECASE):
+            pass
+        if re.match('Ma', hchoice, re.IGNORECASE):
+            pass
+        if re.match('Of', hchoice, re.IGNORECASE) and used_disks:
+            offLineDisk()
+        if re.match('Mi', hchoice, re.IGNORECASE) and is_offline:
+            markMissing()
+        if re.match('Pr', hchoice, re.IGNORECASE):
+            pass
+        if re.match('Rm', hchoice, re.IGNORECASE) and is_missing:
+            replaceMissing()
+        if re.match('Rb', hchoice, re.IGNORECASE) and is_offline:
+            rebuildDisk()
+
+
+# Main loop
+checkControllers()
+scan()
+getControllerDefaults()
+
+choice = ''
+while not re.match('q|quit', '%s' % choice, re.IGNORECASE):
+
+    nodisk_o = True
+    foreign_disks_o = False
+    number_of_hotspares_o = 0
+
+    for phdisk_o in diskdb:
+        if phdisk_o[13] == 1:
+            number_of_hotspares_o += 1
+
+    controllerid_o = 0
+    while controllerid_o < controllernumber:
+        if controllerdb[controllerid_o].avalible_disk != 0:
+            nodisk_o = False
+        if controllerdb[controllerid_o].foreign_disk != 0:
+            foreign_disks_o = True
+        controllerid_o += 1
+    print
+    print getFormat(" <b>Pr</n>) Print Raid Configuration")
+    if not nodisk_o:
+        print getFormat(" <b>Cr</n>) Create Array")
+    if totalarraynumber >= 1:
+        print getFormat(" <b>De</n>) Delete Existing Array(s)")
+    if totalarraynumber >= 1:
+        print getFormat(" <b>Co</n>) Configure Array(s)")
+    if not nodisk_o or number_of_hotspares_o > 0:
+        print getFormat(" <b>Ht</n>) Hotspare Management")
+    if foreign_disks_o:
+        print getFormat(" <b>Fd</n>) Foreign Disk Management")
+    print getFormat(" <b>Ma</n>) Manage Disks")
+    print getFormat(" <b>Sc</n>) Rescan controller")
+
+    print
+    print getFormat(" <b>Q</n>uit) Quit")
+    print
+    try:
+        # Not the best to have this much code in a try statement
+        # but we want to catch all keyboard events down in the
+        # TUI code
+        choice = raw_input(prompt)
+        print
+
+        if re.match('Pr', choice, re.IGNORECASE):
+            print
+            printControllers()
+            with_disks_o = True
+            printArrays(with_disks_o)
+            printAvailableDisks()
+            printOtherDisks()
+
+        if re.match('Cr', choice, re.IGNORECASE):
+            createArray()
+        if re.match('De', choice, re.IGNORECASE):
+            deleteArray()
+        if re.match('Sc', choice, re.IGNORECASE):
+            scan()
+        if re.match('Ht', choice, re.IGNORECASE):
+            manageHotSpares()
+        if re.match('Co', choice, re.IGNORECASE):
+            configArrayOptions()
+        if re.match('Fd', choice, re.IGNORECASE):
+            manageForeignDrives()
+        if re.match('Ma', choice, re.IGNORECASE):
+            manageDisks()
+
+    except (EOFError, KeyboardInterrupt):
+        sys.exit(1)
