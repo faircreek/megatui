@@ -19,6 +19,11 @@
 
 #    Completly transformed into MegaTUI by Olof 
 
+#    Small note, if I knew what this initially small script would morph into
+#    I would never have programmed it like this. It's way to little code 
+#    reuse in it. I guess it's time for a rewrite now when I know what I want
+#    it to do.
+
 import os
 import re
 import sys
@@ -28,6 +33,7 @@ import logging
 import logging.handlers
 from collections import namedtuple
 import traceback
+from distutils.util import strtobool
 
 #######################################################################
 
@@ -97,22 +103,17 @@ prompt = "[%s]> " % IP
 
 controllernumber = 0
 totalarraynumber = 0
+criticalmounts = ["/"]
 
 # Get mapping system disks MegaRaid virtual disks
 diskdict = {}
 
-#Are we on a serial console or not
+# Are we on a serial console or not
 serial = False
 PPID = os.getppid()
 o_string = "/proc/%s/fd/0" % PPID
 if re.match('ttyS', os.path.basename(os.readlink(o_string))):
     serial = True
-
-# Hardcode a max of 16 HBA for now. LDTable must be initiazlied to accept populating list of
-# LD's into each ctlr's list.
-# LDTable = [[] * 16 for itable in range(16)]
-
-# Only Quit or a number, no gobbledygook
 
 
 # Startup
@@ -132,25 +133,14 @@ if len(sys.argv) > 1:
         print_usage()
         sys.exit(1)
 
-logging.raiseExceptions = False  # If logging aint working, trying to log later on
-                                 # in the code will throw an exception. We don't
-                                 # want a try/pass each time we log so set it to false
 
 LOG = logging.getLogger('main')
 LOG.setLevel(logging.INFO)
 
-try:
-    handler = logging.handlers.SysLogHandler("/dev/log", "local3")
-except Exception:
-    pass
-    # typ, exc, tb = sys.exc_info()
-    # fil, line, func, _ = traceback.extract_tb(tb)[-1]
-    # where = "%s:%d in %s" % (fil, line, func)
-    # print "Warning: No logging due to syslog error: %s" % (str(exc))
-else:
-    logformat = ("megacli-tui: %(message)s")
-    handler.setFormatter(logging.Formatter(logformat))
-    LOG.addHandler(handler)
+handler = logging.handlers.SysLogHandler("/dev/log", "local3")
+logformat = ("megacli-tui: %(message)s")
+handler.setFormatter(logging.Formatter(logformat))
+LOG.addHandler(handler)
 
 
 # Functions
@@ -222,6 +212,28 @@ def getOutput(cmd):
     return lines
 
 
+def mountpointToDevice(mountpoint):
+    with open("/proc/mounts") as f:
+        for line in f:
+            if line.split(" ", 2)[1] == mountpoint:
+                return os.path.basename(line.split(" ", 1)[0]).rstrip("0123456789")
+
+
+def criticalArray(controller_array_id, message):
+    for array in arraydb:
+        if array.controller_array_id == controller_array_id:
+            for mount in criticalmounts:
+                if mountpointToDevice(mount) == array.osdisk:
+                    print "%s" % message
+                    ochoice = raw_input('Please press enter to return to menu! ')
+                    print
+                    if re.match('root', '%s' % ochoice, re.IGNORECASE):
+                        return False
+                    else:
+                        return True
+    return False
+
+
 def osMap():
     files_list = glob('/sys/block/sd?/device')
     for a_file in sorted(files_list):
@@ -234,11 +246,6 @@ def osMap():
 
 def getFormat(string):
     term = formatControl()
-    # PPID = os.getppid()
-    # serial = "/proc/%s/fd/0" % PPID
-    # No matter what mute formating when we are on a serial console
-    # Regardless what curses tells us.
-    # if re.match('ttyS', os.path.basename(os.readlink(serial))):
     if serial:
         string = string.replace("<b>", "")
         string = string.replace("<bl>", "")
@@ -291,6 +298,24 @@ def getFormat(string):
     return string
 
 
+def yesNo(query, default="n"):
+    if default == "n":
+        lprompt = getFormat('%s [y/<b>N</n>]: ' % query)
+    elif default == "y":
+        lprompt = getFormat('%s [<b>Y</n>/n]: ' % query)
+    else:
+        lprompt = '%s [y/n]: ' % query
+    val = raw_input(lprompt)
+    if re.match('^$', '%s' % val, re.IGNORECASE):
+        val = default
+    try:
+        ret = strtobool(val)
+    except ValueError:
+        print "Please answer with a y/n"
+        return yesNo(query, default)
+    return ret
+
+
 def returnControllerNumber(output):
     # Get if we have any controllers at all
     for line in output:
@@ -316,7 +341,8 @@ def returnWdthFromArrayCol(glarray, idx):
     return maxwdth
 
 
-#Will return length of a field in an array of namedtuples, field_in_namedtuple is a string containing the name of the field
+# Will return length of a field in an array of namedtuples, field_in_namedtuple
+# is a string containing the name of the field
 def returnWdthFromArrayOfNamedTupleField(array_of_namedtuples, field_in_namedtuple):
     maxwdth = 0
     for namedtuple_thingy in array_of_namedtuples:
@@ -507,7 +533,10 @@ def arrayTable(output, controllerid, arrayid):
         osdisk = diskdict[controller_array_id]
     except KeyError:
         osdisk = "Notfound"
-    array = ArrayDB(int(controllerid), int(arrayid), controller_array_id, osdisk, raidtype, size, strpsz, properties, dskcache, state, targetid, inprogress, properties + properties2, dskaccess)
+    array = ArrayDB(int(controllerid), int(arrayid), controller_array_id,
+                    osdisk, raidtype, size, strpsz, properties, dskcache,
+                    state, targetid, inprogress, properties + properties2,
+                    dskaccess)
     return array
 
 
@@ -551,7 +580,8 @@ def diskTable(output, controllerid):
     i = 0
     for line in output:
         if re.match(r'Enclosure Device ID: .*$', line.strip()):
-            # We match here early in the analysis so reset the vars if this is a new disk we're reading..
+            # We match here early in the analysis so reset the vars if this is
+            # a new disk we're reading..
             oldenclid = enclid
             enclid = line.split(':')[1].strip()
             if oldenclid:
@@ -620,10 +650,11 @@ def diskTable(output, controllerid):
             checknext = i
         if re.match(r'^Array #:', line.strip()) and checknext == i - 1:
             arrayid = line.split(':')[1].strip()
+        # Drive temp is amongst the last few lines matched, decide here if we
+        # add information to the table..
         if re.match(r'Drive Temperature :.*$', line.strip()):
             temp = line.split(':')[1].strip()
             temp = re.sub('\(.*\)', '', temp)
-        # Drive temp is amongst the last few lines matched, decide here if we add information to the table..
             if arrayid == -1:
                 if subfstate == 'Unconfigured':
                     dbgprint('Unconfigured Disk: Arrayid: %s DiskId: %s %s %s' % (arrayid, diskid, olddiskid, fstate))
@@ -643,7 +674,11 @@ def diskTable(output, controllerid):
                     fstate = 'Bad'
             if fstate == "Hotspare, Spun Up":
                 fstate = 'HotSP, Spun Up'
-            phdisk = PhDisk(int(controllerid), int(arrayid), int(spanid), int(armid), mtype, model, int(dsize), fstate, speed, temp, int(enclid), int(slotid), int(lsidid), hotspare, hotspare_type, foreign_state)
+            phdisk = PhDisk(int(controllerid), int(arrayid), int(spanid),
+                            int(armid), mtype, model, int(dsize), fstate,
+                            speed, temp, int(enclid), int(slotid),
+                            int(lsidid), hotspare, hotspare_type,
+                            foreign_state)
             table.append(phdisk)
         i += 1
     return table
@@ -669,7 +704,7 @@ def checkForeign(fgrouptable):
             continue
         for phdisk in diskdb:
             if phdisk.cid == fdisk.cid and phdisk.lsidid == fdisk.lsidid:
-                dbgprint(str("Controller %s:%s Disk ID %s:%s Foreign %s" % (phdisk.cid, fdisk.cid, phdisk.lsidid, fdisk.lsidid, phdisk.foreign_state)))
+                dbgprint("Controller %s:%s Disk ID %s:%s Foreign %s" % (phdisk.cid, fdisk.cid, phdisk.lsidid, fdisk.lsidid, phdisk.foreign_state))
                 if phdisk.foreign_state != 1:
                     return False
     return True
@@ -722,7 +757,8 @@ def foreignTable(output, controllerid):
 
     for line in output:
         if re.match(r'DISK GROUP: .*$', line.strip()) or re.match(r'SPANNED DISK GROUP: .*$', line.strip()):
-            # We match here early in the analysis so reset the vars if this is a new disk we're reading..
+            # We match here early in the analysis so reset the vars if this is
+            # a new disk we're reading..
             disk_group = int(line.split(':')[1].strip())
             if reset_it == 1:
                 fdisktable = []
@@ -738,7 +774,8 @@ def foreignTable(output, controllerid):
             # Extract the SCSI Target ID
             targetid = line.strip().split(':')[2].split(')')[0].strip()
         if re.match(r'^RAID Level.*?:.*$', line.strip()):
-            # Extract the primary raid type, decide on X0 RAID level later when we hit Span Depth
+            # Extract the primary raid type, decide on X0 RAID level later when
+            # we hit Span Depth
             raidlvl = int(line.strip().split(':')[1].split(',')[0].split('-')[1].strip())
         if re.match(r'^Size.*?:.*$', line.strip()):
             # Size reported in MB
@@ -757,7 +794,8 @@ def foreignTable(output, controllerid):
                 size = line.strip().split(':')[1].strip('GB').strip()
                 size = str(int(round(float(size)))) + 'G'
         if re.match(r'^Span Depth.*?:.*$', line.strip()):
-            # If Span Depth is greater than 1 chances are we have a RAID 10, 50 or 60
+            # If Span Depth is greater than 1 chances are we have a RAID 10, 50
+            # or 60
             spandepth = int(line.strip().split(':')[1].strip())
         if re.match(r'^State.*?:.*$', line.strip()):
             state = line.strip().split(':')[1].strip()
@@ -780,7 +818,8 @@ def foreignTable(output, controllerid):
             # Compute the RAID level
             raidtype = raidType(spandepth, diskperspan, raidlvl)
         if re.match(r'Enclosure Device ID: .*$', line.strip()):
-            # We match here early in the analysis so reset the vars if this is a new disk we're reading..
+            # We match here early in the analysis so reset the vars if this is
+            # a new disk we're reading..
             enclid = line.split(':')[1].strip()
         if re.match(r'^Device Id: .*$', line.strip()):
             lsidid = line.split(':')[1].strip()
@@ -942,7 +981,11 @@ def parseControllerDefaults(output, cid):
                 default_bbu_cache = True
         if re.match(r'^Exit Code.*$', line.strip()):
             # End of file lets return the table
-            ctrl_defaults = Ctrl_Defaults(cid, max_strip_size, min_strip_size, default_strip_size, access_policy_allowed, read_policy_allowed, default_read_policy, write_policy_allowed, default_write_policy, default_bbu_cache, io_policy_allowed, default_io_policy, disk_cache_policy_allowed)
+            ctrl_defaults = Ctrl_Defaults(cid, max_strip_size, min_strip_size, default_strip_size,
+                                          access_policy_allowed, read_policy_allowed,
+                                          default_read_policy, write_policy_allowed,
+                                          default_write_policy, default_bbu_cache, io_policy_allowed,
+                                          default_io_policy, disk_cache_policy_allowed)
             return ctrl_defaults
 
 
@@ -979,7 +1022,7 @@ def printControllers():
                 hba.temp,
                 hba.fw_version)
             i += 1
-        print ''
+        print
     else:
         print "No MegaRAID or PERC adapter detected on your system!"
         exit(1)
@@ -992,22 +1035,22 @@ def printArrays(with_disks):
     while controllerid < controllernumber:
         printArraysByController(controllerid, with_disks)
         controllerid += 1
-    print ''
+    print
 
 
 def printArrayListsByController(controllerid, array_list, with_disks):
-    ldfmt = str('%-5s | %-7s | %7s | %7s | %10s | %8s | %8s | %8s | %-12s ')
+    default_ldfmt = '%-5s | %-7s | %7s | %7s | %10s | %8s | %8s | %8s | %-12s '
     i = 0
     for array_to_print in array_list:
         for array in arraydb:
             if array.cid == controllerid and array.arrayid == array_to_print:
                 if with_disks or (not with_disks and i == 0):
-                    string = ldfmt % ("-- ID", "Type", "Size", "Strpsz", "Flags", "DskCache", "Status", "OS Disk", "InProgress")
+                    string = default_ldfmt % ("-- ID", "Type", "Size", "Strpsz", "Flags", "DskCache", "Status", "OS Disk", "InProgress")
                     print getFormat("<b>%s</n>" % string)
                 if array.state != "Optimal":
-                    state = getFormat("<b><r><bl><bg_green><red>%s</n>" % array.state)
+                    ldfmt = getFormat('%-5s | %-7s | %7s | %7s | %10s | %8s | <b><red>%8s</n> | %8s | %-12s ')
                 else:
-                    state = array.state
+                    ldfmt = default_ldfmt
                 print ldfmt % (
                     array.controller_array_id,
                     array.raidtype,
@@ -1015,29 +1058,29 @@ def printArrayListsByController(controllerid, array_list, with_disks):
                     array.strpsz,
                     array.properties,
                     array.dskcache,
-                    state,
+                    array.state,
                     array.osdisk,
                     array.inprogress)
                 # if not array.state == 'Optimal':
                 #     bad = True
                 if with_disks:
                     printUsedDisksByControllerArray(controllerid, array.arrayid)
-                    print ''
+                    print
                 i += 1
 
 
 def printArraysByController(controllerid, with_disks):
-    ldfmt = str('%-5s | %-7s | %7s | %7s | %10s | %8s | %8s | %8s | %-12s ')
     i = 0
+    default_ldfmt = '%-5s | %-7s | %7s | %7s | %10s | %8s | %8s | %8s | %-12s '
     for array in arraydb:
         if array.cid == controllerid:
             if with_disks or (not with_disks and i == 0):
-                string = ldfmt % ("-- ID", "Type", "Size", "Strpsz", "Flags", "DskCache", "Status", "OS Disk", "InProgress")
+                string = default_ldfmt % ("-- ID", "Type", "Size", "Strpsz", "Flags", "DskCache", "Status", "OS Disk", "InProgress")
                 print getFormat("<b><u>%s</u></n>" % string)
             if array.state != "Optimal":
-                state = getFormat("<b><r><bl><bg_green><red>%s</n>" % array.state)
+                ldfmt = getFormat('%-5s | %-7s | %7s | %7s | %10s | %8s | <b><red>%8s</n> | %8s | %-12s ')
             else:
-                state = array.state
+                ldfmt = default_ldfmt
             print ldfmt % (
                 array.controller_array_id,
                 array.raidtype,
@@ -1045,14 +1088,14 @@ def printArraysByController(controllerid, with_disks):
                 array.strpsz,
                 array.properties,
                 array.dskcache,
-                state,
+                array.state,
                 array.osdisk,
                 array.inprogress)
             # if not array.state == 'Optimal':
             #     bad = True
             if with_disks:
                 printUsedDisksByControllerArray(controllerid, array.arrayid)
-                print ''
+                print
             i += 1
 
 
@@ -1064,7 +1107,7 @@ def printUsedDisks():
         while controllerid < controllernumber:
             printUsedDisksByController(controllerid)
             controllerid += 1
-        print ''
+        print
 
 
 def printUsedDisksByController(controllerid):
@@ -1149,7 +1192,7 @@ def printAvailableDisks():
         while controllerid < controllernumber:
             printAvailableDiskByController(controllerid, False)
             controllerid += 1
-        print ''
+        print
 
 
 def printAvailableDiskByController(controllerid, id_first):
@@ -1160,7 +1203,6 @@ def printAvailableDiskByController(controllerid, id_first):
     i = 0
     for phdisk in diskdb:
         if phdisk.cid == controllerid and phdisk.arrayid == -1:
-
             # Header
             if (i == 0):
                 if id_first:
@@ -1210,7 +1252,7 @@ def printOtherDisks():
     while controllerid < controllernumber:
         printOtherDiskByController(controllerid)
         controllerid += 1
-    print ''
+    print
 
 
 def printOtherDiskByController(controllerid):
@@ -1218,10 +1260,9 @@ def printOtherDiskByController(controllerid):
     i = 0
     for phdisk in diskdb:
         if phdisk.cid == controllerid and phdisk.arrayid <= -2:
-
             # Header
             if (i == 0):
-                string = drvfmt % ("ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Disk  ID")
+                string = drvfmt % ("ID", "Type", "Size Gb", "Status", "Speed", "Slot ID", "Disk ID")
                 print ("<b>%s</n>" % string)
             # Drive information
             print drvfmt % (
@@ -1293,9 +1334,12 @@ def setArrayOptions(controllerid, arrayid, creation):
 
     # Read Policy:
     # NORA (No read ahead), RA (Read ahead), ADRA (Adaptive read ahead):
-    # Nora, best for file access that is mainly random (this should be your setting on SSD)
+    # Nora, best for file access that is mainly random (this should be your
+    #   setting on SSD)
     # Read ahead best for file access that is mainly sequntial
-    # Adaptive Read ahead, if the two latest file access are sequential then it turns on read ahead, just to turn it off when disc access goes back to be random. This is most likely what you want for most cases.
+    # Adaptive Read ahead, if the two latest file access are sequential then
+    #   it turns on read ahead, just to turn it off when disc access goes back
+    #   to be random. This is most likely what you want for most cases.
 
     ochoice = ''
     if controller_default.read_policy_allowed:
@@ -1310,7 +1354,8 @@ def setArrayOptions(controllerid, arrayid, creation):
             print
             print "NORA, best for file access that is mainly random, recomended on SSD drives"
             print "RA, best for file access that is higly sequential"
-            print "ADRA, if two last file access was sequential, RA will be turned on until file access again becomes random"
+            print "ADRA, if two last file access was sequential, RA will be turned on until file"
+            print "      access again becomes random"
             print
             print getFormat(" <b>NORA</n>)  No Read Ahead")
             print getFormat(" <b>RA</n>)    Read Ahead")
@@ -1338,9 +1383,14 @@ def setArrayOptions(controllerid, arrayid, creation):
                 print "%s is not a valid choice" % ochoice
 
     # IO Read Policy, doesn't affect ReadAhead
-    # Direct :In direct I/O mode, reads are not buffered in cache memory. Data is transferred to the cache and the host concurrently. If the same data block is read again, it comes from cache memory. This is the default, and in nearly all cases the best.
-    # Cached : In cached I/O mode, all reads are buffered in cache memory, then it's feed to the host, you don't want this unless you have some very specific needs with small files that are accessed and then accessed again.
-    # io_policy_allowed, default_io_policy controller_default 10 11
+    # Direct: In direct I/O mode, reads are not buffered in cache memory. Data
+    # is transferred to the cache and the host concurrently. If the same data
+    # block is read again, it comes from cache memory. This is the default, and
+    # in nearly all cases the best.
+    # Cached: In cached I/O mode, all reads are buffered in cache memory, then
+    # it's feed to the host, you don't want this unless you have some very
+    # specific needs with small files that are accessed and then accessed
+    # again.
     ochoice = ''
     if controller_default.io_policy_allowed:
         while True:
@@ -1351,9 +1401,11 @@ def setArrayOptions(controllerid, arrayid, creation):
                 current_default_value = current_array.all_properties.split(',')[3]
                 print getFormat("Select Read Cache Policy, current value is <b>%s</n>:" % current_default_value)
             print
-            print getFormat("<b>NOTE</n>: This option has nothing to do with Read Ahead and it's possible cache")
-            print "Direct: Reads are not buffered, read is trasfered to host and read cache concurrently."
-            print "Cached: All reads are first transferred to the cache, then transferred to the host from the cache"
+            print getFormat("<b>NOTE</n>: This option has nothing to do with Read Ahead and its possible cache")
+            print "Direct: Reads are not buffered, read is transferred to host and read cache"
+            print "        concurrently."
+            print "Cached: All reads are first transferred to the cache, then transferred to the"
+            print "        host from the cache."
             print
             print getFormat(" <b>D</n>) Direct")
             print getFormat(" <b>C</n>) Cached")
@@ -1387,12 +1439,14 @@ def setArrayOptions(controllerid, arrayid, creation):
                 print getFormat("Select Write Policy, default is <b>%s</n>:" % current_default_value)
             else:
                 current_default_value = current_array.all_properties.split(',')[1]
-                print getFormat("Select Write Policy, return for current <b>%s</n>:" % current_default_value)
+                print getFormat("Select Write Policy, current value is <b>%s</n>:" % current_default_value)
             print
-            print "Write Through, when the physical drives has received all data completion signal is sent to the host"
-            print "Write Back, when the controller has received all data completion signal is sent to the host"
+            print "Write Through, when the physical drives has received all data completion signal"
+            print "               is sent to the host."
+            print "Write Back, when the controller has received all data completion signal is sent"
+            print "            to the host."
             print
-            print getFormat(" <b>WT</n>) Write Trough")
+            print getFormat(" <b>WT</n>) Write Through")
             print getFormat(" <b>WB</n>) Write Back")
             print
             print getFormat(" <b>Enter</n>) %s" % current_default_value)
@@ -1413,8 +1467,10 @@ def setArrayOptions(controllerid, arrayid, creation):
             else:
                 print "%s is not a valid choice" % ochoice
 
-    # Bad BBU, in case of bad Battery backup, use cache for Write through, i.e. swith to Write back in case of bad battery
-    # CachedBadBBU , NoCachedBadBBU default_bbu_cache (bool) controller_default.default_bbu_cache
+    # Bad BBU, in case of bad Battery backup, use cache for Write through,
+    # i.e. swith to Write back in case of bad battery
+    # CachedBadBBU , NoCachedBadBBU default_bbu_cache (bool)
+    # controller_default.default_bbu_cache
     ochoice = ''
     if controller_default.default_bbu_cache:
         default_bbu_string = 'CachedBadBBU'
@@ -1422,15 +1478,18 @@ def setArrayOptions(controllerid, arrayid, creation):
         default_bbu_string = 'NoCachedBadBBU'
 
     while True:
+        print "Select Write Cache Policy for faulty or missing cache backup battery,"
         if creation:
             current_default_value = default_bbu_string
-            print getFormat("Select Write Cache Policy for faulty or missing cache backup battery No/Yes, default <b>%s</n>:" % current_default_value)
+            print getFormat("default value is <b>%s</n>:" % current_default_value)
         else:
             current_default_value = current_array.all_properties.split(',')[2]
-            print getFormat("Select Write Cache Policy for faulty or missing cache backup battery No/Yes, current <b>%s</n>:" % current_default_value)
+            print getFormat("current value is <b>%s</n>:" % current_default_value)
         print
-        print "No (NoCachedBadBBU), will not use write cache when faulty or missing cache backup battery on controller"
-        print "Yes (CachedBadBBU) will force use of cache even when faulty or missing cache backup battery on controller"
+        print "No (NoCachedBadBBU), will not use write cache when faulty or missing cache"
+        print "                     backup battery on controller"
+        print "Yes (CachedBadBBU), will force use of cache even when faulty or missing cache"
+        print "                    backup battery on controller"
         print
         print getFormat(" <b>No</n>)   NoCachedBadBBU")
         print getFormat(" <b>Yes</n>)  CachedBadBBU")
@@ -1453,17 +1512,21 @@ def setArrayOptions(controllerid, arrayid, creation):
         else:
             print "%s is not a valid choice" % ochoice
 
-    # Drive Cache Note the default is the default of the disk which isn't avalible to us through the
+    # Drive Cache Note the default is the default of the disk which isn't
+    # avalible to us through the
     # Enable: Enable the drive cache. Should be enabled on SSD drives
-    # Disable: Disable the drive cache, you might exprience preformace degradation but it will be safer writes since if you loose power to the disks you will lose the date that was in the cache buffer.
+    # Disable: Disable the drive cache, you might exprience preformace
+    # degradation but it will be safer writes since if you loose power to the
+    # disks you will lose the date that was in the cache buffer.
     ochoice = ''
     if controller_default.disk_cache_policy_allowed and not creation:
         while True:
             current_default_value = current_array.dskcache
-            print getFormat("Select Disk Cache Policy, Enable, Disable, current is <b>%s</n>" % current_default_value)
-            print "Disks own Default, can't be determined at this point"
+            print getFormat("Select Disk Cache Policy, current value is <b>%s</n>" % current_default_value)
+            print
             print "Disable (DisDskCache), disables the disks built in cache, recomended on all HDD"
             print "Enable (EnDskCache), enables the disks built in cache, recomended on all SSD"
+            print "Default, use disk's own default (can't be determined at this point)"
             print
             print getFormat(" <b>D</n>isable) DisDskCache")
             print getFormat(" <b>E</n>enable) EnDskCache")
@@ -1521,10 +1584,7 @@ def setArrayOptions(controllerid, arrayid, creation):
                     strpsz.index(stripe_choice)
                     options.append(str(' -strpsz' + str(stripe_choice)))
                     break
-                except ValueError:  # Exception as ex:
-                    # template = "An exception of type {0} occured. Arguments:\n{1!r}"
-                    # message = template.format(type(ex).__name__, ex.args)
-                    # print message
+                except ValueError:
                     print "Stripe size of %d KB it not a valid selection" % stripe_choice
                     print
                     continue
@@ -1623,7 +1683,6 @@ def getControllers():
 
     controllerid = 0
     while controllerid < controllernumber:
-
         controllermodel = 'Unknown'
         controllerram = 'Unknown'
         controllerrev = 'Unknown'
@@ -1664,7 +1723,11 @@ def getControllers():
                 if phdisk.foreign_state:
                     foreign_disk += 1
 
-        hba_card = HBA_Card(controllerid, controllerstring, controllermodel, controllerram, controllertemp, controllerrev, used_disk, avalible_disk, hotspare_disk, unconf_bad_disk, jbod_disk, bad_disk, foreign_disk)
+        hba_card = HBA_Card(controllerid, controllerstring, controllermodel,
+                            controllerram, controllertemp, controllerrev,
+                            used_disk, avalible_disk, hotspare_disk,
+                            unconf_bad_disk, jbod_disk, bad_disk,
+                            foreign_disk)
         controllerdb.append(hba_card)
 
         controllerid += 1
@@ -1699,22 +1762,28 @@ def getDiskSize(controllerid, lsiid):
 
 
 def checkSpanRaidSizes(raidtype, numberofdisks, size):
-    # Ok so if you want spans you need at least two span, hence at least half the disks in each span, so you start at modulostart i.e. number of disks / 2 + 1
+    # If you want spans you need at least two span, hence at least half the
+    # disks in each span, so start at modulostart i.e. number of disks / 2 + 1
     modulostart = numberofdisks / 2 + 1
     raidsetups = []
-    # so you setup a range going backwards from modulostart to, min number of disks you need in a span it's 4 for raid 6 and 3 for raid 5 i.e. "raid type" - 2 (you need 3 to mark the end of the array), -1 is for backwards.
+    # so you setup a range going backwards from modulostart to, min number
+    # of disks you need in a span. it's 4 for raid 6 and 3 for raid 5 i.e.
+    # "raid type" - 2 (you need 3 to mark the end of the array)
     for x in range(modulostart, raidtype - 3, -1):
         if not numberofdisks % x:
-            # Only when your make a division without a reminder you will have the same  number of disks in each span
+            # Only when your make a division without a reminder you will have
+            # the same number of disks in each span
             physical_disks = x
-            # The number of spans  is the total number of disks divided by number of disks in each span
+            # The number of spans is the total number of disks divided by
+            # number of disks in each span
             spans = numberofdisks / x
-            # size of each span is the all disk minus the wasted disks for parity, in raid six its two disks (raidtype - 4) raid 5 its one disks (raid type -4)
+            # size of each span is the all disk minus the wasted disks for
+            # parity, in raid six its two disks (raidtype - 4) raid 5 its one
+            # disks (raid type -4)
             spansize = size * (physical_disks - (raidtype - 4))
             totalsize = spans * spansize
-            #loss is the number of spans times number of disks wasted as per above
+            # loss is the number of spans times number of disks wasted as per above
             lost = spans * size * (raidtype - 4)
-            # It's simples as a meerkat can get, see http://www.comparethemeerkat.com/
             raidsetups.append([spans, physical_disks, spansize, totalsize, lost])
     return raidsetups
 
@@ -1723,7 +1792,9 @@ def checkSpanRaid(raidtype, numberofdisks):
 
     modulostart = numberofdisks / 2 + 1
     raidsetups = []
-    # Ok simmilar to above, if we can't get an divide without a reminder we can't facilitate the spaned raid level with the given number of disks, its simples a a meerkat can get ;) - we just return a string saying not_possible.
+    # Ok simmilar to above, if we can't get an divide without a reminder we
+    # can't facilitate the spaned raid level with the given number of disks,
+    # just return a string saying not_possible.
     for x in range(modulostart, raidtype - 3, -1):
         if not numberofdisks % x:
             raidsetups.append([numberofdisks / x, x])
@@ -1751,9 +1822,8 @@ def getPossibleRaidLevels(numberofdisks):
         possibleraid.append(6)
     if numberofdisks >= 4 and numberofdisks % 2 == 0:
         possibleraid.append(10)
-    # The more problimatic raid levels 5 and 6, it's not as simple as
-    # modulo 3 and 4 since it all depens on # of drives in each span
-    # and how many spans
+    # The more problimatic raid levels 5 and 6, it's not as simple as modulo 3
+    # and 4 since it all depens on # of drives in each span and how many spans
     if numberofdisks >= 6 and checkSpanRaid(5, numberofdisks)[0] != 'not_possible':
         possibleraid.append(50)
     if numberofdisks >= 8 and checkSpanRaid(6, numberofdisks)[0] != 'not_possible':
@@ -1769,7 +1839,6 @@ def getRaidChoice(possibleraid, physical_disks, phsize):
     drvfmt = "%-10s | %-20s | %-10s "
 
     while not re.match('q|quit', '%s' % rchoice, re.IGNORECASE):
-
         print "Selected disk(s):"
         if len(physical_disks_copy) == 0:
             print lastdisk
@@ -1830,7 +1899,6 @@ def getRaidChoice(possibleraid, physical_disks, phsize):
         rchoice = raw_input(prompt)
         print
         if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
-
             try:
                 raidchoice = int(rchoice.strip())
             except ValueError:
@@ -1840,10 +1908,7 @@ def getRaidChoice(possibleraid, physical_disks, phsize):
             try:
                 possibleraid.index(raidchoice)
                 return raidchoice
-            except ValueError:  # Exception as ex:
-                # template = "An exception of type {0} occured. Arguments:\n{1!r}"
-                # message = template.format(type(ex).__name__, ex.args)
-                # print message
+            except ValueError:
                 print "Raid %d it not a valid selection" % raidchoice
                 print
     return -1
@@ -1870,7 +1935,7 @@ def createEncslotidv2(controllerid, raiddisks):
 def createSimpleRaid(controllerid, physical_disks, raidchoice, settings):
     encslotid = createEncslotidv2(controllerid, physical_disks)
     encslotidstring = str("\"[%s]\"") % ",".join(encslotid)
-    cmd = '%s  -CfgLdAdd -r%d %s %s -a%d ' % (megaclipath, raidchoice, encslotidstring, settings, controllerid)
+    cmd = '%s -CfgLdAdd -r%d %s %s -a%d -NoLog' % (megaclipath, raidchoice, encslotidstring, settings, controllerid)
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
@@ -1913,7 +1978,7 @@ def createSpanningRaid(controllerid, physical_disks, raidchoice, size, settings)
             array_string += encslotidstring
             x += 2
             i += 1
-        cmd = '%s  -CfgSpanAdd -r%d %s %s -a%d ' % (megaclipath, raidchoice, array_string, settings, controllerid)
+        cmd = '%s -CfgSpanAdd -r%d %s %s -a%d -NoLog' % (megaclipath, raidchoice, array_string, settings, controllerid)
         LOG.info(cmd)
         output = getOutput(cmd)
         if is_error(output):
@@ -2005,7 +2070,7 @@ def createSpanningRaid(controllerid, physical_disks, raidchoice, size, settings)
                     array_string += str('-Array' + str(x) + '"[' + spanstring + ']" ')
                     x += 1
 
-                cmd = '%s  -CfgSpanAdd -r%d %s %s -a%d ' % (megaclipath, raidchoice, array_string, settings, controllerid)
+                cmd = '%s -CfgSpanAdd -r%d %s %s -a%d -NoLog' % (megaclipath, raidchoice, array_string, settings, controllerid)
                 LOG.info(cmd)
                 output = getOutput(cmd)
                 if is_error(output):
@@ -2064,7 +2129,7 @@ def createArrayOnCnt(controllerid):
         print
         cont = False
         size = 0
-        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE):
+        if not re.match('q|quit', '%s' % rchoice, re.IGNORECASE) and not re.match('^$', '%s' % rchoice, re.IGNORECASE) and not cont:
             i = 0
             if re.match('a|all', '%s' % rchoice, re.IGNORECASE):
                 rchoice = ','.join(str(x) for x in free_disks)
@@ -2096,9 +2161,6 @@ def createArrayOnCnt(controllerid):
                     cont = True
                     break
                 i += 1
-
-            # else in for or while loops is the same as "if no break"  Which is very backward you would normaly want "if break": do XYZ, that one would be useful after all.
-            # Not saying it aint useful we do make use of it but it woudl been a whole lot more useful if we had else to mean if break.
 
             if cont:
                 continue
@@ -2135,7 +2197,7 @@ def selectControllerToCreateOn(what_to_create):
             if controllerdb[controllerid].avalible_disk != 0:
                 break
             controllerid += 1
-        else:  # Wow we could use the worthless else after all ;)
+        else:
             print
             print "No disks available to create %s from" % what_to_create
             print
@@ -2250,14 +2312,12 @@ def selectArray(message, cid):
                 if array.controller_array_id == rchoice and cid == array.cid:
                     arrayid = array.arrayid
                     break
-
             else:
                 print "Invalid array ID %s" % rchoice
                 print
                 continue
 
             break   # You will only reach this line if you had a break in the for loop
-
     else:
         return -1
     return arrayid
@@ -2287,7 +2347,6 @@ def selectArrayList(message, cid, array_list):
                 continue
 
             break
-
     else:
         return -1
     return arrayid
@@ -2320,8 +2379,7 @@ def selectDiskInArray(message, cid, arrayid):
 
 
 def createArray():
-    spin = 0
-    while spin == 0:
+    while True:
         cid = selectControllerToCreateOn("array")
         if cid == -1:
             return
@@ -2368,7 +2426,7 @@ def configArrayOptions():
 
         print "Setting array %s config values" % rchoice
         for option in options:
-            cmd = '%s  -LDSetProp %s -L%d -a%d ' % (megaclipath, option, arrayid, controllerid)
+            cmd = '%s -LDSetProp %s -L%d -a%d -NoLog' % (megaclipath, option, arrayid, controllerid)
             LOG.info(cmd)
             output = getOutput(cmd)
             if is_error(output):
@@ -2413,8 +2471,12 @@ def deleteArray():
     else:
         return
 
+    if criticalArray(rchoice, getFormat('<b>You are about to delete a system disk, which will render the system inoperable.</n>')):
+        return
+    if not yesNo("Are you certain you want to delete %s" % rchoice):
+        return
     print "Deleting %s" % rchoice
-    cmd = '%s  -CfgLdDel  -L%d -a%d ' % (megaclipath, arrayid, controllerid)
+    cmd = '%s -CfgLdDel -L%d -a%d -NoLog' % (megaclipath, arrayid, controllerid)
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
@@ -2503,7 +2565,7 @@ def deleteHotSpare():
             for phdisk in diskdb:
                 if phdisk.hotspare == 1 and phdisk.lsidid == hotsparechoice:
                     physdrv = "[%s:%s]" % (phdisk.enclid, phdisk.slotid)
-                    cmd = '%s  -PDHSP -Rmv -PhysDrv"%s" -a%d ' % (megaclipath, physdrv, phdisk.cid)
+                    cmd = '%s -PDHSP -Rmv -PhysDrv"%s" -a%d -NoLog' % (megaclipath, physdrv, phdisk.cid)
                     break
             else:
                 print "Invalid HotSpare ID %s" % hchoice
@@ -2527,9 +2589,7 @@ def deleteHotSpare():
 
 
 def createHotSpare():
-
-    spin = 0
-    while spin == 0:
+    while True:
         cid = selectControllerToCreateOn("hotspare")
         if cid == -1:
             return
@@ -2580,7 +2640,6 @@ def createHotSpare():
                     print "Invalid array ID %s" % hchoice
                     print
                     continue
-
                 break
         else:
             return
@@ -2612,12 +2671,12 @@ def createHotSpare():
             return
 
     physdrv = createEncslotidv2(cid, [hotsparechoice])
-    physdrv = str("\"[%s]\"") % ",".join(physdrv)
+    physdrv = '"[%s]"' % ",".join(physdrv)
 
     if dedicated:
-        cmd = '%s  -PDHSP -Set -Dedicated -Array%d -PhysDrv%s -a%d' % (megaclipath, arrayid, physdrv, cid)
+        cmd = '%s -PDHSP -Set -Dedicated -Array%d -PhysDrv%s -a%d -NoLog' % (megaclipath, arrayid, physdrv, cid)
     else:
-        cmd = '%s  -PDHSP -Set -PhysDrv%s -a%d' % (megaclipath, physdrv, cid)
+        cmd = '%s -PDHSP -Set -PhysDrv%s -a%d -NoLog' % (megaclipath, physdrv, cid)
 
     LOG.info(cmd)
     output = getOutput(cmd)
@@ -2657,9 +2716,9 @@ def manageHotSpares():
             print getFormat(" <b>Cr</n>) Create HotSpares")
         if number_of_hotspares >= 1:
             print getFormat(" <b>De</n>) Delete HotSpares")
-        print ""
+        print
         print getFormat(" <b>Q</n>uit) Quit")
-        print ""
+        print
         hchoice = raw_input(prompt)
         print
 
@@ -2679,7 +2738,7 @@ def scanForeignDisks():
     scan()
     controllerid = 0
     while controllerid < controllernumber:
-        if controllerdb[controllerid][12] != 0:
+        if controllerdb[controllerid].foreign_disk != 0:
             cmd = '%s -CfgForeign -Preview -a%d -NoLog' % (megaclipath, controllerid)
             output = getOutput(cmd)
             foreigndiskdb.append(foreignTable(output, controllerid))
@@ -2693,18 +2752,18 @@ def printForeignDisks():
         except IndexError:
             print controller
         for diskgroup in controller:
-            dgfmt = str('%-5s | %-7s | %7s | %7s ')
+            dgfmt = '%-5s | %-7s | %7s | %7s '
             string = dgfmt % ("-- ID", "Type", "Size", "Status")
             print getFormat("<b>%s</n>" % string)
             if diskgroup.state != "Optimal":
-                state = getFormat("<b><r><bl><bg_green><red>%s</n>" % diskgroup.state)
+                dgfmt = getFormat('%-5s | %-7s | %7s | <b><red>%7s</n> ')
             else:
-                state = diskgroup.state
+                dgfmt = '%-5s | %-7s | %7s | %7s '
             print dgfmt % (
                 "c%sa%s" % (controller[0].cid, diskgroup.disk_group),
                 diskgroup.raidtype,
                 diskgroup.size,
-                state)
+                diskgroup.state)
             i = 0
             for fdisk in diskgroup.FDiskTable:
                 if i == 0:
@@ -2731,7 +2790,7 @@ def clearForeignDisks():
     cid = selectController("to clear foreign disks on", which_controllers)
     if cid == -1:
         return
-    cmd = '%s -CfgForeign -Clear -a%d' % (megaclipath, cid)
+    cmd = '%s -CfgForeign -Clear -a%d -NoLog' % (megaclipath, cid)
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
@@ -2753,7 +2812,7 @@ def importForeignDisks():
     cid = selectController("to import foreign disks on", which_controllers)
     if cid == -1:
         return
-    cmd = '%s -CfgForeign -Import -a%d' % (megaclipath, cid)
+    cmd = '%s -CfgForeign -Import -a%d -NoLog' % (megaclipath, cid)
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
@@ -2862,11 +2921,16 @@ def offLineDisk():
     arrayid = selectArray("to off line disks on", cid)
     if arrayid == -1:
         return
+    controller_array_id = "c%sa%s" % (cid, arrayid)
+    if criticalArray(controller_array_id, getFormat('<b>You are about to offline a disk in a system array</n>')):
+        return
     disklist = selectDiskInArray("to off line", cid, arrayid)
     if disklist[0] == -1:
         return
-    disk = str('\"[' + str(disklist[10]) + ':' + str(disklist[11]) + ']\"')
-    cmd = '%s -PDOffline -PhysDrv%s -a%d' % (megaclipath, disk, cid)
+    disk = str('\"[' + str(disklist.enclid) + ':' + str(disklist.slotid) + ']\"')
+    if not yesNo("Are you certain you want to offline %s" % disk):
+        return
+    cmd = '%s -PDOffline -PhysDrv%s -a%d -NoLog' % (megaclipath, disk, cid)
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
@@ -2909,8 +2973,13 @@ def markMissing():
                 continue
             for phdisk in offline_table:
                 if phdisk.lsidid == disk_choice:
-                    physdrv = str('[' + str(phdisk.enclid) + ':' + str(phdisk.slotid) + ']')
-                    cmd = '%s  -PDMarkMissing  -PhysDrv"%s" -a%d ' % (megaclipath, physdrv, phdisk.cid)
+                    physdrv = '[%s:%s]' % (phdisk.enclid, phdisk.slotid)
+                    controller_array_id = "c%sa%s" % (phdisk.cid, phdisk.arrayid)
+                    if criticalArray(controller_array_id, getFormat('<b>You are about to mark a disk as missing in a system array</n>')):
+                        return
+                    if not yesNo("Are you certain you want to mark missing %s" % physdrv):
+                        return
+                    cmd = '%s -PDMarkMissing -PhysDrv"%s" -a%d -NoLog' % (megaclipath, physdrv, phdisk.cid)
                     break
             else:
                 print "Invalid Disk ID %s" % hchoice
@@ -2949,7 +3018,7 @@ def replaceMissing():
         if controller_array_list[-1] != missing_array[0]:
             arrayid = missing_array[0]
             controller_array_list.extend([arrayid])
-    cid = selectController(" to replace missing disk on", controller_array_list)
+    cid = selectController("to replace missing disk on", controller_array_list)
     if cid == -1:
         return
 
@@ -2997,7 +3066,7 @@ def replaceMissing():
         if missing[0] == cid and missing[1] == arrayid:
             row = missing[2]
 
-    cmd = '%s -PdReplaceMissing -PhysDrv%s  -Array%d -row%s -a%d' % (megaclipath, physdrv, arrayid, row, cid)
+    cmd = '%s -PdReplaceMissing -PhysDrv%s -Array%d -row%s -a%d -NoLog' % (megaclipath, physdrv, arrayid, row, cid)
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
@@ -3038,8 +3107,8 @@ def rebuildDisk():
                 continue
             for phdisk in offline_table:
                 if phdisk.lsidid == disk_choice:
-                    physdrv = str('[' + str(phdisk.enclid) + ':' + str(phdisk.slotid) + ']')
-                    cmd = '%s  -PDRbld -Start  -PhysDrv"%s" -a%d ' % (megaclipath, physdrv, phdisk.cid)
+                    physdrv = '[%s:%s]' % (phdisk.enclid, phdisk.slotid)
+                    cmd = '%s -PDRbld -Start -PhysDrv"%s" -a%d -NoLog' % (megaclipath, physdrv, phdisk.cid)
                     break
             else:
                 print "Invalid Disk ID %s" % hchoice
@@ -3051,7 +3120,7 @@ def rebuildDisk():
     LOG.info(cmd)
     output = getOutput(cmd)
     if is_error(output):
-        print getFormat("<b>An error occoured, please investigate</n>")
+        print getFormat("<b>An error occurred, please investigate</n>")
         print output
         LOG.error(output)
     else:
@@ -3111,14 +3180,14 @@ def manageDisks():
             print getFormat(" <b>Of</n>) Offline Disk")
         if is_offline:
             print getFormat(" <b>Mi</n>) Mark Disk as Missing")
-        if free_disks:
-            # print " Pr) Prep Disk for Removal"
+        # print " Pr) Prep Disk for Removal"
+        if free_disks and is_missing:
             print getFormat(" <b>Rm</n>) Replace Missing Disk")
-        if is_missing:
+        if is_offline:
             print getFormat(" <b>Rb</n>) Rebuild Disk")
-        print ""
+        print
         print getFormat(" <b>Q</n>uit) Quit")
-        print ""
+        print
         hchoice = raw_input(prompt)
         print
         if re.match('Rd', hchoice, re.IGNORECASE):
@@ -3152,7 +3221,7 @@ while not re.match('q|quit', '%s' % choice, re.IGNORECASE):
     number_of_hotspares_o = 0
 
     for phdisk_o in diskdb:
-        if phdisk_o[13] == 1:
+        if phdisk_o.hotspare == 1:
             number_of_hotspares_o += 1
 
     controllerid_o = 0
@@ -3171,7 +3240,7 @@ while not re.match('q|quit', '%s' % choice, re.IGNORECASE):
     if totalarraynumber >= 1:
         print getFormat(" <b>Co</n>) Configure Array(s)")
     if not nodisk_o or number_of_hotspares_o > 0:
-        print getFormat(" <b>Ht</n>) Hotspare Management")
+        print getFormat(" <b>Ht</n>) Hotspare Mangement")
     if foreign_disks_o:
         print getFormat(" <b>Fd</n>) Foreign Disk Management")
     print getFormat(" <b>Ma</n>) Manage Disks")
@@ -3209,6 +3278,5 @@ while not re.match('q|quit', '%s' % choice, re.IGNORECASE):
             manageForeignDrives()
         if re.match('Ma', choice, re.IGNORECASE):
             manageDisks()
-
     except (EOFError, KeyboardInterrupt):
         sys.exit(1)
