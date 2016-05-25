@@ -118,7 +118,7 @@ if re.match('ttyS', os.path.basename(os.readlink(o_string))):
 
 # Startup
 def print_usage():
-    print 'Usage: megaraid-status [--debug]'
+    print 'Usage: MegaTUI [--debug]'
 
 
 if len(sys.argv) > 2:
@@ -138,7 +138,7 @@ LOG = logging.getLogger('main')
 LOG.setLevel(logging.INFO)
 
 handler = logging.handlers.SysLogHandler("/dev/log", "local3")
-logformat = ("megacli-tui: %(message)s")
+logformat = ("megatui: %(message)s")
 handler.setFormatter(logging.Formatter(logformat))
 LOG.addHandler(handler)
 
@@ -162,7 +162,6 @@ def which(program):
     else:
         # Add some defaults
         os.environ["PATH"] += os.pathsep + '/opt/MegaRAID/MegaCli'
-        os.environ["PATH"] += os.pathsep + '/ms/dist/hwmgmt/bin'
         os.environ["PATH"] += os.pathsep + os.path.dirname(os.path.realpath(sys.argv[0]))
         for path in os.environ["PATH"].split(os.pathsep):
             dbgprint('Looking in PATH ' + str(path))
